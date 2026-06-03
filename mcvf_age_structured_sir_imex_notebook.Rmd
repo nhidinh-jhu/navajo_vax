@@ -1,0 +1,658 @@
+---
+title: "A Basic McKendrick-von Foerster Age-Structured SIR Model in R"
+author: ""
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 9,
+  fig.height = 5.5,
+  fig.retina = 2
+)
+
+.libPaths(c("C:/Users/nhdinh/jh", .libPaths()))
+
+library(deSolve)
+library(ReacTran)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(knitr)
+
+theme_set(theme_minimal(base_size = 13))
+```
+
+# Purpose
+
+This notebook builds and simulates a basic age-structured SIR model of McKendrick-von Foerster type. The goal is not to produce a fitted Hib model. The goal is to show, as clearly as possible, how one passes from an age-structured epidemic PDE to a working numerical simulation in R.
+
+I have written this notebook for the same audience as the companion PDF: epidemiologists who are comfortable reading equations, but who may not have any background in numerical ODEs, PDE solvers, or numerical analysis.
+
+# The Model
+
+We work with three age-dependent densities:
+
+- \(S(t,\alpha)\): susceptibles of age \(\alpha\),
+- \(I(t,\alpha)\): infectious individuals of age \(\alpha\),
+- \(R(t,\alpha)\): recovered individuals of age \(\alpha\).
+
+The age-structured SIR system is
+
+\[
+\partial_t S + \partial_\alpha S = -\lambda(t,\alpha)S - \nu(\alpha)S,
+\]
+\[
+\partial_t I + \partial_\alpha I = \lambda(t,\alpha)S - \bigl(\gamma_{\mathrm{rec}} + \nu(\alpha)\bigr)I,
+\]
+\[
+\partial_t R + \partial_\alpha R = \gamma_{\mathrm{rec}}I - \nu(\alpha)R.
+\]
+
+Here:
+
+- \(\nu(\alpha)\) is the age-dependent mortality rate,
+- \(\gamma_{\mathrm{rec}}\) is the recovery rate,
+- \(\lambda(t,\alpha)\) is the force of infection.
+
+For this notebook I use the simple age-specific force of infection
+
+\[
+\lambda(t,\alpha) = \beta\,s(\alpha)\,\frac{\int_0^{\alpha_{\max}} q(\alpha')I(t,\alpha')\,d\alpha'}{\int_0^{\alpha_{\max}} \bigl(S+I+R\bigr)(t,\alpha')\,d\alpha'}.
+\]
+
+So:
+
+- \(s(\alpha)\) is an age-specific susceptibility modifier,
+- \(q(\alpha')\) is an age-specific infectiousness modifier,
+- \(\beta\) is a transmission scale.
+
+We also need a boundary condition at age zero:
+
+\[
+S(t,0) = B(t), \qquad I(t,0)=0, \qquad R(t,0)=0,
+\]
+
+where \(B(t)\) is the birth influx. Here I define it using an age-dependent fertility profile \(m(\alpha)\):
+
+\[
+B(t) = \int_0^{\alpha_{\max}} m(\alpha)\bigl(S+I+R\bigr)(t,\alpha)\,d\alpha.
+\]
+
+That gives us a complete McVF epidemic model in one structuring variable, age.
+
+# Why Use `deSolve` and `ReacTran`?
+
+In R, the most standard package pair for this kind of transport-reaction problem is:
+
+- `ReacTran`, which helps discretize transport terms like ageing and diffusion;
+- `deSolve`, which advances the resulting ODE system in time.
+
+They play different roles.
+
+`ReacTran` answers the question:
+
+- if we divide age into bins, how much mass flows from one age bin into the next?
+
+`deSolve` answers the question:
+
+- once we have a large ODE system for those bins, how do we advance it forward in time reliably?
+
+So the basic philosophy is often called the method of lines:
+
+1. discretize age, which turns the PDE into a large ODE system,
+2. use an ODE solver to evolve that system in time.
+
+# Why IMEX Splitting?
+
+The PDE contains two qualitatively different mechanisms.
+
+1. Ageing transport: people move from younger ages to older ages.
+2. Epidemic reactions: infection, recovery, and mortality change compartment membership.
+
+In this notebook I use a simple IMEX splitting strategy.
+
+`IMEX` stands for `implicit-explicit`.
+
+That means:
+
+- one part of the model is handled explicitly,
+- another part is handled implicitly.
+
+Here I do the following.
+
+- The ageing transport step is handled explicitly.
+- The epidemic reaction step is handled implicitly by calling a stiff ODE solver from `deSolve`.
+
+Why split the model this way?
+
+- The transport part is very structured and easy to understand in a direct step-by-step way.
+- The reaction part can behave more stiffly, and `deSolve` already provides robust implicit solvers for that.
+- Pedagogically, this lets us keep the ideas separate: first ageing, then epidemic change.
+
+# A Plain-English Explanation of the CFL Condition
+
+Because the ageing step is explicit, there is one stability rule we have to respect.
+
+The key quantity is
+
+\[
+\text{CFL number} = \frac{\Delta t}{\Delta \alpha}.
+\]
+
+Here:
+
+- \(\Delta \alpha\) is the width of one age bin,
+- \(\Delta t\) is the size of one time step.
+
+Plain English:
+
+- in one time step, a person ages by about \(\Delta t\),
+- one age bin has width \(\Delta \alpha\),
+- so \(\Delta t / \Delta \alpha\) tells us what fraction of one age bin a person crosses in a single update.
+
+If this number is too large, then the explicit transport step tries to move information too far in one update, and the numerical approximation becomes unstable or unphysical.
+
+For the basic explicit upwind transport step used here, we want
+
+\[
+\frac{\Delta t}{\Delta \alpha} \le 1.
+\]
+
+So the CFL condition is just a bookkeeping rule that says:
+
+> do not let one numerical time step age people by more than about one full age bin.
+
+For this audience, it is perfectly fine to think of the CFL condition as a step-size safety rule for the explicit ageing update.
+
+# Discretization in Words
+
+We divide age into bins and keep track of how much susceptible, infectious, and recovered mass sits in each one.
+
+That turns the PDE into a large coupled ODE system.
+
+At each time step we do this:
+
+1. compute the current force of infection and birth rate from the current age distribution;
+2. use `ReacTran` to compute how ageing moves mass across age bins over one explicit step;
+3. treat that transport-updated state as the input to a reaction subproblem;
+4. hand the reaction subproblem to `deSolve`, which advances infection, recovery, and mortality over one time step using an implicit solver.
+
+So the algorithm is simple to describe:
+
+- `ReacTran` handles ageing,
+- `deSolve` handles epidemic change,
+- the two are coupled by operator splitting.
+
+# Grids and Illustrative Ingredients
+
+The parameter choices below are illustrative only. They are chosen so that the dynamics are visible and the numerical scheme is easy to understand.
+
+```{r grids-and-parameters}
+age_max <- 80 # Assuming oldest age is 80
+da <- 0.5 # Width of one age bin
+dt <- 0.1 # Size of one time step
+time_max <- 12 # Simulation horizon 
+
+grid <- setup.grid.1D(x.up = 0, L = age_max, N = round(age_max / da))
+age <- grid$x.mid # Age values at bin centers
+time <- seq(0, time_max, by = dt)
+
+n_age <- length(age) # number of age bins
+cfl <- dt / da # Set CFL condition: Do not let one numerical time step age people by more than about one full age bin. 
+stopifnot(cfl <= 1) # sanity check 
+
+beta <- 40 # Transmission coefficient/scale - illustrative value for now
+gamma_rec <- 2 # Recovery rate - illustrative value for now 
+
+susceptibility <- 0.65 + 0.75 * exp(-((age - 4) / 6)^2) 
+# Gaussian shape - This example sets everyone to has baseline susceptibility of 0.65, with a childhood bump (susceptibility at 0.75) peaking at age 4, width ~6 years 
+infectiousness <- 0.55 + 0.95 * exp(-((age - 8) / 7)^2)
+# Gaussian shape - This example sets everyone to has baseline infectiousness of 0.55, with a peak at 0.95 (high transmission in school-age children), peaking at age 8, width ~7 years
+mortality <- 0.008 + 0.06 / (1 + exp(-(age - 72) / 5))
+# Logistic (sigmoid curve) with background mortality of 0.008, steep increase starting around age 72, and width of about 5 years. This is just an illustrative shape for now. We could also do a more realistic U-shaped curve with high mortality in infancy and old age, but this is simpler for now.
+fertility_raw <- exp(-0.5 * ((age - 28) / 6)^2)
+# Pure Gaussian shape with peak fertility of 1 at age 28 and width of about 6 years. 
+
+N0_shape <- exp(-0.035 * age) 
+# Exponential decay shape for the initial age distribution. This is just an illustrative shape for now. We could also do a more realistic shape based on demographic data, but this is simpler for now. 
+N0_shape <- N0_shape / sum(N0_shape * da) # Normalize to density 
+
+fertility_scale <- sum(mortality * N0_shape * da) / sum(fertility_raw * N0_shape * da)
+# This scaling factor ensures that the initial population is at demographic equilibrium, meaning that the total number of births balances the total number of deaths. We compute it by taking the ratio of the total mortality (integrated over age) to the total raw fertility (also integrated over age), both weighted by the initial age distribution. This way, when we apply the fertility profile to the initial population, we get a birth influx that exactly offsets the deaths, keeping the population stable at the start of the simulation.
+
+fertility <- fertility_scale * fertility_raw
+# The final fertility profile is the raw Gaussian shape scaled by the factor computed above to ensure demographic equilibrium at the start of the simulation.
+
+param_table <- tibble(
+  quantity = c(
+    "Maximum age",
+    "Age-bin width da",
+    "Time-step size dt",
+    "Simulation horizon",
+    "CFL number dt/da",
+    "Transmission scale beta",
+    "Recovery rate gamma_rec"
+  ),
+  value = c(age_max, da, dt, time_max, cfl, beta, gamma_rec)
+)
+
+kable(param_table, digits = 3)
+```
+
+```{r ingredient-plots}
+ingredient_df <- tibble(
+  age = age,
+  susceptibility = susceptibility,
+  infectiousness = infectiousness,
+  mortality = mortality,
+  fertility = fertility
+) |>
+  pivot_longer(-age, names_to = "quantity", values_to = "value")
+
+ggplot(ingredient_df, aes(age, value)) +
+  geom_line(linewidth = 1.0, colour = "#1f78b4") +
+  facet_wrap(~ quantity, scales = "free_y", ncol = 2) +
+  labs(
+    title = "Illustrative age-dependent ingredients",
+    x = "Age (years)",
+    y = "Value"
+  )
+```
+
+# Initial Condition
+
+I start with a mostly susceptible age distribution, a small infectious bump centered in childhood, and a modest recovered component among older ages.
+
+```{r initial-condition}
+I0 <- 0.006 * N0_shape * exp(-0.5 * ((age - 7) / 3)^2)
+# Overall prevalence here sets at 0.6% of the population is currently infectious
+# Scaled by population size (NO_shape)
+# Age profile of infection, with infection concentrated around age 7, spreading +/- 3 years. 
+R0 <- 0.04 * N0_shape * (1 - exp(-age / 18))
+# Ceiling of prior immunity, at most 4% of any age group has been previously infected. 
+# Scaled by population size (NO_shape)
+# Immunity accumulates with age: Near-zero in newborns, rising to ~4% by old age, inflection around age 18
+S0 <- pmax(N0_shape - I0 - R0, 0)
+
+initial_df <- tibble(
+  age = age,
+  S = S0,
+  I = I0,
+  R = R0
+) |>
+  pivot_longer(-age, names_to = "compartment", values_to = "density")
+
+ggplot(initial_df, aes(age, density, colour = compartment)) +
+  geom_line(linewidth = 1.0) +
+  scale_colour_manual(values = c(S = "#1b9e77", I = "#d95f02", R = "#7570b3")) +
+  labs(
+    title = "Initial age profiles",
+    x = "Age (years)",
+    y = "Density"
+  )
+```
+
+# Core Numerical Pieces
+
+## Force of infection and birth influx
+
+```{r forcing-functions}
+force_of_infection <- function(S, I, R, beta, susceptibility, infectiousness, da) {
+  total_pop <- sum((S + I + R) * da)
+  infectious_pressure <- sum(infectiousness * I * da) / max(total_pop, 1e-12)
+  beta * susceptibility * infectious_pressure
+}
+
+birth_influx <- function(S, I, R, fertility, da) {
+  sum(fertility * (S + I + R) * da)
+}
+```
+
+## Transport step with `ReacTran`
+
+The ageing term is the McVF transport term. Numerically, `tran.1D` computes the net change in each age bin produced by inflow from the younger neighboring bin and outflow to the older neighboring bin.
+
+For susceptibles, the inflow boundary value at age zero is the birth rate. For infectious and recovered individuals, the age-zero boundary value is zero.
+
+```{r transport-step}
+age_transport_step <- function(u, boundary_value, dt, grid) {
+  transport_change <- tran.1D(
+    C = u,
+    C.up = boundary_value,
+    C.down = tail(u, 1),
+    v = 1,
+    D = 0,
+    dx = grid
+  )$dC
+
+  u + dt * transport_change
+}
+```
+
+## Reaction step with `deSolve`
+
+After the transport step, we freeze the force of infection over the next short interval of length \(\Delta t\) and solve the reaction system
+
+\[
+\dot S = -(\lambda + \nu)S,
+\qquad
+\dot I = \lambda S - (\gamma_{\mathrm{rec}} + \nu)I,
+\qquad
+\dot R = \gamma_{\mathrm{rec}}I - \nu R.
+\]
+
+This is where `deSolve` comes in. I use the implicit solver `radau`, which is a reasonable choice when one wants a stable reaction solve without having to code an implicit method by hand.
+
+```{r reaction-step}
+pack_state <- function(S, I, R) {
+  c(S = S, I = I, R = R)
+}
+
+unpack_state <- function(y, n_age) {
+  list(
+    S = y[1:n_age],
+    I = y[(n_age + 1):(2 * n_age)],
+    R = y[(2 * n_age + 1):(3 * n_age)]
+  )
+}
+
+reaction_rhs <- function(t, y, parms) {
+  state <- unpack_state(y, length(parms$lambda))
+
+  with(parms, {
+    dS <- -(lambda + mortality) * state$S
+    dI <- lambda * state$S - (gamma_rec + mortality) * state$I
+    dR <- gamma_rec * state$I - mortality * state$R
+
+    list(c(dS, dI, dR))
+  })
+}
+
+reaction_step_desolve <- function(S_star, I_star, R_star, lambda, mortality, gamma_rec, dt) {
+  y_star <- pack_state(S_star, I_star, R_star)
+
+  sol <- ode(
+    y = y_star,
+    times = c(0, dt),
+    func = reaction_rhs,
+    parms = list(
+      lambda = lambda,
+      mortality = mortality,
+      gamma_rec = gamma_rec
+    ),
+    method = "radau",
+    rtol = 1e-6,
+    atol = 1e-8
+  )
+
+  unpack_state(sol[2, -1], length(lambda))
+}
+```
+
+# The Full IMEX Simulator
+
+This function implements the splitting scheme.
+
+At each time step it does the following.
+
+1. Compute the current force of infection and birth influx.
+2. Apply one explicit ageing step with `ReacTran`.
+3. Apply one implicit reaction step with `deSolve`.
+4. Store outputs for plotting.
+
+```{r simulator}
+simulate_mcvf_sir_imex <- function(
+  S0, I0, R0,
+  age, time, da, dt, grid,
+  beta, gamma_rec,
+  susceptibility, infectiousness,
+  fertility, mortality,
+  snapshot_times = c(0, 1, 2, 4, 8, 12),
+  heatmap_stride = 2
+) {
+  S <- S0
+  I <- I0
+  R <- R0
+
+  summary_store <- vector("list", length(time))
+  snapshot_store <- list()
+  heatmap_store <- list()
+  snap_counter <- 1
+
+  for (n in seq_along(time)) {
+    t_now <- time[n]
+
+    lambda_now <- force_of_infection(S, I, R, beta, susceptibility, infectiousness, da)
+    births_now <- birth_influx(S, I, R, fertility, da)
+
+    total_S <- sum(S * da)
+    total_I <- sum(I * da)
+    total_R <- sum(R * da)
+    total_N <- total_S + total_I + total_R
+    incidence_now <- sum(lambda_now * S * da)
+
+    summary_store[[n]] <- tibble(
+      time = t_now,
+      S = total_S,
+      I = total_I,
+      R = total_R,
+      N = total_N,
+      births = births_now,
+      incidence = incidence_now,
+      mean_lambda = mean(lambda_now)
+    )
+
+    if (any(abs(t_now - snapshot_times) < dt / 2)) {
+      snapshot_store[[snap_counter]] <- tibble(
+        time = t_now,
+        age = age,
+        S = S,
+        I = I,
+        R = R
+      )
+      snap_counter <- snap_counter + 1
+    }
+
+    if ((n - 1) %% heatmap_stride == 0) {
+      heatmap_store[[length(heatmap_store) + 1]] <- tibble(
+        time = t_now,
+        age = age,
+        I = I,
+        prevalence = I / pmax(S + I + R, 1e-12)
+      )
+    }
+
+    if (n == length(time)) break
+
+    S_star <- age_transport_step(S, births_now, dt, grid)
+    I_star <- age_transport_step(I, 0, dt, grid)
+    R_star <- age_transport_step(R, 0, dt, grid)
+
+    react <- reaction_step_desolve(
+      S_star = S_star,
+      I_star = I_star,
+      R_star = R_star,
+      lambda = lambda_now,
+      mortality = mortality,
+      gamma_rec = gamma_rec,
+      dt = dt
+    )
+
+    S <- pmax(react$S, 0)
+    I <- pmax(react$I, 0)
+    R <- pmax(react$R, 0)
+  }
+
+  list(
+    summary = bind_rows(summary_store),
+    snapshots = bind_rows(snapshot_store),
+    heatmap = bind_rows(heatmap_store)
+  )
+}
+```
+
+# Run the Simulation
+
+```{r run-simulation}
+out <- simulate_mcvf_sir_imex(
+  S0 = S0,
+  I0 = I0,
+  R0 = R0,
+  age = age,
+  time = time,
+  da = da,
+  dt = dt,
+  grid = grid,
+  beta = beta,
+  gamma_rec = gamma_rec,
+  susceptibility = susceptibility,
+  infectiousness = infectiousness,
+  fertility = fertility,
+  mortality = mortality,
+  snapshot_times = c(0, 1, 2, 4, 8, 12),
+  heatmap_stride = 2
+)
+
+summary_df <- out$summary
+snapshots_df <- out$snapshots
+heatmap_df <- out$heatmap
+
+kable(head(summary_df, 8), digits = 4)
+```
+
+# Aggregate Dynamics
+
+These are the total susceptible, infectious, and recovered masses after integrating over age.
+
+```{r aggregate-dynamics}
+summary_long <- summary_df |>
+  select(time, S, I, R) |>
+  pivot_longer(-time, names_to = "compartment", values_to = "mass")
+
+ggplot(summary_long, aes(time, mass, colour = compartment)) +
+  geom_line(linewidth = 1.0) +
+  scale_colour_manual(values = c(S = "#1b9e77", I = "#d95f02", R = "#7570b3")) +
+  labs(
+    title = "Aggregate SIR dynamics",
+    x = "Time (years)",
+    y = "Total mass"
+  )
+```
+
+```{r incidence-and-births}
+summary_aux <- summary_df |>
+  select(time, incidence, births, mean_lambda) |>
+  pivot_longer(-time, names_to = "quantity", values_to = "value")
+
+ggplot(summary_aux, aes(time, value)) +
+  geom_line(linewidth = 1.0, colour = "#2c7fb8") +
+  facet_wrap(~ quantity, scales = "free_y", ncol = 1) +
+  labs(
+    title = "Incidence, births, and mean force of infection",
+    x = "Time (years)",
+    y = NULL
+  )
+```
+
+# Age Profiles at Selected Times
+
+```{r age-profiles}
+snapshot_long <- snapshots_df |>
+  pivot_longer(cols = c(S, I, R), names_to = "compartment", values_to = "density") |>
+  mutate(time_label = paste0("t = ", format(round(time, 1), nsmall = 1)))
+
+ggplot(snapshot_long, aes(age, density, colour = compartment)) +
+  geom_line(linewidth = 0.9) +
+  facet_grid(compartment ~ time_label, scales = "free_y") +
+  scale_colour_manual(values = c(S = "#1b9e77", I = "#d95f02", R = "#7570b3")) +
+  labs(
+    title = "Age profiles of S, I, and R at selected times",
+    x = "Age (years)",
+    y = "Density"
+  ) +
+  theme(legend.position = "none")
+```
+
+# Heatmaps
+
+These heatmaps are often the easiest way to see what an age-structured McVF model is doing.
+
+```{r infection-heatmap}
+ggplot(heatmap_df, aes(time, age, fill = I)) +
+  geom_raster(interpolate = FALSE) +
+  scale_fill_gradient(low = "#f7fbff", high = "#08306b") +
+  labs(
+    title = "Infectious density over age and time",
+    x = "Time (years)",
+    y = "Age (years)",
+    fill = "I"
+  )
+```
+
+```{r prevalence-heatmap}
+ggplot(heatmap_df, aes(time, age, fill = prevalence)) +
+  geom_raster(interpolate = FALSE) +
+  scale_fill_gradient(low = "#fff5eb", high = "#7f2704") +
+  labs(
+    title = "Age-specific prevalence over age and time",
+    x = "Time (years)",
+    y = "Age (years)",
+    fill = "Prev."
+  )
+```
+
+# What the Algorithm Is Doing in Plain English
+
+Here is the whole numerical method in plain English.
+
+1. Look at the current age distribution.
+2. Use it to compute how much infection pressure each age experiences.
+3. Use it to compute how many newborns enter at age zero.
+4. Move everybody a little bit to the right along the age axis using `ReacTran`.
+5. Starting from that aged population, let infection, recovery, and mortality act for one short time interval using `deSolve`.
+6. Repeat.
+
+That is the entire IMEX logic:
+
+- explicit transport for ageing,
+- implicit ODE solve for reactions.
+
+# Why This Still Counts as a McVF Model
+
+The age variable here is not just a label for broad age groups. It is an actual transport coordinate.
+
+The term
+
+\[
+\partial_t U + \partial_\alpha U
+\]
+
+means people are continuously moving from younger ages to older ages. The numerical transport step mirrors that directly by shifting mass across neighboring age bins.
+
+That is what makes this a true McKendrick-von Foerster style model rather than a static age-binned ODE with no ageing process.
+
+# Natural Extensions
+
+Once this basic notebook is working, the next natural extensions are:
+
+1. replace the simple force of infection by a full age-contact kernel \(K_\alpha(\alpha,\alpha')\);
+2. add an immunity coordinate \(\gamma\) so the model becomes a two-variable McVF system in \((\alpha,\gamma)\);
+3. replace the SIR reaction block with a colonization and invasive disease structure more appropriate for Hib;
+4. add vaccination and waning as jump and transport terms in the immunity coordinate;
+5. calibrate the age-dependent ingredients using data rather than illustrative curves.
+
+# Session Information
+
+```{r session-info}
+sessionInfo()
+```

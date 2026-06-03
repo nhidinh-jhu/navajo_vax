@@ -1,0 +1,271 @@
+---
+title: "Contact Kernel Factorization in Age and Immunity"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(grid)
+```
+
+## Goal
+
+This notebook builds illustrative ingredients for a factorized transmission surface
+
+\[
+\beta(\alpha,\gamma,\alpha',\gamma')
+=
+\tau\,B_{\alpha}(\alpha,\alpha')\,B_{\gamma}(\gamma,\gamma'),
+\]
+with
+\[
+B_{\alpha}(\alpha,\alpha') = s(\alpha)K_{\alpha}(\alpha,\alpha')i(\alpha'),
+\qquad
+B_{\gamma}(\gamma,\gamma') = r(\gamma)K_{\gamma}(\gamma,\gamma')q(\gamma').
+\]
+
+Here \(\alpha\) is age and \(\gamma\) is immune status.
+
+## Helper Functions and Grids
+
+```{r helpers}
+rescale01 <- function(x) {
+  rng <- range(x, na.rm = TRUE)
+  if (diff(rng) == 0) return(rep(0, length(x)))
+  (x - rng[1]) / diff(rng)
+}
+
+bump <- function(x, mu, sigma, height = 1) {
+  height * exp(-0.5 * ((x - mu) / sigma)^2)
+}
+
+sigmoid_down <- function(x, mid, slope, low = 0, high = 1) {
+  low + (high - low) / (1 + exp(slope * (x - mid)))
+}
+
+ages <- seq(0, 85, by = 1)
+immune <- seq(0, 1, length.out = 101)
+
+age_grid <- expand.grid(alpha = ages, alpha_p = ages) |>
+  as_tibble()
+immune_grid <- expand.grid(gamma = immune, gamma_p = immune) |>
+  as_tibble()
+```
+
+## Alternative Age-Side Ingredients
+
+```{r age-components}
+make_age_susceptibility <- function() {
+  tibble(
+    alpha = rep(ages, 3),
+    value = c(
+      rescale01(0.30 + bump(ages, 8, 9, 1.0) + bump(ages, 72, 14, 0.25)),
+      rescale01(0.28 + bump(ages, 14, 10, 0.55) + bump(ages, 42, 18, 0.35)),
+      rescale01(0.55 + bump(ages, 10, 14, 0.20) - bump(ages, 55, 18, 0.08))
+    ),
+    choice = factor(
+      rep(c("Child-amplified", "Bimodal exposure", "Nearly flat"), each = length(ages)),
+      levels = c("Child-amplified", "Bimodal exposure", "Nearly flat")
+    )
+  )
+}
+
+make_age_infectiousness <- function() {
+  tibble(
+    alpha_p = rep(ages, 3),
+    value = c(
+      rescale01(0.20 + bump(ages, 11, 7, 1.1) + bump(ages, 38, 16, 0.10)),
+      rescale01(0.22 + bump(ages, 28, 11, 0.85) + bump(ages, 64, 16, 0.18)),
+      rescale01(0.35 + bump(ages, 16, 13, 0.35) + bump(ages, 48, 18, 0.20))
+    ),
+    choice = factor(
+      rep(c("School-age source", "Young-adult bridge", "Broad mild shedding"), each = length(ages)),
+      levels = c("School-age source", "Young-adult bridge", "Broad mild shedding")
+    )
+  )
+}
+
+make_age_kernels <- function() {
+  age_grid |>
+    mutate(
+      diag_band = exp(-((alpha - alpha_p)^2) / (2 * 8^2)),
+      child_child = bump(alpha, 10, 6) * bump(alpha_p, 10, 6, 1.3),
+      parent_child = bump(alpha, 35, 10) * bump(alpha_p, 9, 5, 0.9),
+      child_parent = bump(alpha, 9, 5) * bump(alpha_p, 35, 10, 0.75),
+      elder_care = bump(alpha, 75, 8) * bump(alpha_p, 48, 11, 0.6),
+      school_hub = bump(alpha, 15, 7) * bump(alpha_p, 15, 7, 1.1),
+      assortative = rescale01(1.00 * diag_band + 0.25 * parent_child + 0.20 * child_parent + 0.12),
+      intergenerational = rescale01(0.55 * diag_band + 0.80 * parent_child + 0.65 * child_parent + 0.55 * elder_care + 0.08),
+      school_centred = rescale01(0.45 * diag_band + 0.95 * school_hub + 0.30 * parent_child + 0.18)
+    ) |>
+    select(alpha, alpha_p, assortative, intergenerational, school_centred) |>
+    pivot_longer(cols = c(assortative, intergenerational, school_centred), names_to = "choice", values_to = "K") |>
+    mutate(choice = factor(choice,
+      levels = c("assortative", "intergenerational", "school_centred"),
+      labels = c("Assortative", "Intergenerational", "School-centred")
+    ))
+}
+
+age_s_df <- make_age_susceptibility()
+age_i_df <- make_age_infectiousness()
+age_K_df <- make_age_kernels()
+
+age_s_plot <- ggplot(age_s_df, aes(alpha, value, colour = choice)) +
+  geom_line(linewidth = 1.2) +
+  scale_colour_manual(values = c("#d95f02", "#7570b3", "#1b9e77")) +
+  labs(title = expression(s(alpha)), x = expression(alpha), y = "Relative weight", colour = NULL) +
+  coord_cartesian(ylim = c(0, 1.02), expand = FALSE) +
+  theme_minimal(base_size = 12)
+
+age_i_plot <- ggplot(age_i_df, aes(alpha_p, value, colour = choice)) +
+  geom_line(linewidth = 1.2) +
+  scale_colour_manual(values = c("#1b9e77", "#e7298a", "#66a61e")) +
+  labs(title = expression(i(alpha*"'")), x = expression(alpha*"'"), y = "Relative weight", colour = NULL) +
+  coord_cartesian(ylim = c(0, 1.02), expand = FALSE) +
+  theme_minimal(base_size = 12)
+
+age_K_plot <- ggplot(age_K_df, aes(alpha, alpha_p, fill = K)) +
+  geom_raster() +
+  facet_wrap(~choice, nrow = 1) +
+  coord_equal(expand = FALSE) +
+  scale_fill_gradientn(colours = c("#f7fbff", "#c6dbef", "#6baed6", "#2171b5", "#08306b"), limits = c(0, 1)) +
+  labs(title = expression(K[alpha](alpha, alpha*"'")), x = expression(alpha), y = expression(alpha*"'")) +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid = element_blank())
+
+age_s_plot
+age_i_plot
+age_K_plot
+```
+
+## Alternative Immunity-Side Ingredients
+
+```{r immunity-components}
+make_immune_susceptibility <- function() {
+  tibble(
+    gamma = rep(immune, 3),
+    value = c(
+      1 - 0.75 * immune,
+      sigmoid_down(immune, mid = 0.35, slope = 9, low = 0.08, high = 1),
+      0.12 + 0.88 * exp(-4.2 * immune)
+    ),
+    choice = factor(
+      rep(c("Leaky linear", "Threshold protection", "Near-sterilizing"), each = length(immune)),
+      levels = c("Leaky linear", "Threshold protection", "Near-sterilizing")
+    )
+  )
+}
+
+make_immune_infectiousness <- function() {
+  tibble(
+    gamma_p = rep(immune, 3),
+    value = c(
+      0.25 + 0.75 * exp(-3.0 * immune),
+      sigmoid_down(immune, mid = 0.25, slope = 11, low = 0.02, high = 1),
+      0.15 + 0.85 * exp(-1.2 * immune)
+    ),
+    choice = factor(
+      rep(c("Residual shedding", "Sharp sterilization", "Slow decay"), each = length(immune)),
+      levels = c("Residual shedding", "Sharp sterilization", "Slow decay")
+    )
+  )
+}
+
+make_immune_kernels <- function() {
+  immune_grid |>
+    mutate(
+      diag_band = exp(-((gamma - gamma_p)^2) / (2 * 0.12^2)),
+      low_low = bump(gamma, 0.10, 0.12) * bump(gamma_p, 0.10, 0.12, 1.1),
+      high_source_low_target = bump(gamma, 0.18, 0.16) * bump(gamma_p, 0.80, 0.14, 0.85),
+      broad = rescale01(0.50 + 0.15 * diag_band),
+      assortative = rescale01(0.20 + 1.00 * diag_band),
+      low_hotspot = rescale01(0.10 + 0.85 * low_low + 0.55 * high_source_low_target + 0.10 * diag_band)
+    ) |>
+    select(gamma, gamma_p, broad, assortative, low_hotspot) |>
+    pivot_longer(cols = c(broad, assortative, low_hotspot), names_to = "choice", values_to = "K") |>
+    mutate(choice = factor(choice,
+      levels = c("broad", "assortative", "low_hotspot"),
+      labels = c("Broad", "Assortative", "Low-immunity hotspot")
+    ))
+}
+
+imm_r_df <- make_immune_susceptibility()
+imm_q_df <- make_immune_infectiousness()
+imm_K_df <- make_immune_kernels()
+
+imm_r_plot <- ggplot(imm_r_df, aes(gamma, value, colour = choice)) +
+  geom_line(linewidth = 1.2) +
+  scale_colour_manual(values = c("#d95f02", "#7570b3", "#1b9e77")) +
+  labs(title = expression(r(gamma)), x = expression(gamma), y = "Relative weight", colour = NULL) +
+  coord_cartesian(ylim = c(0, 1.02), expand = FALSE) +
+  theme_minimal(base_size = 12)
+
+imm_q_plot <- ggplot(imm_q_df, aes(gamma_p, value, colour = choice)) +
+  geom_line(linewidth = 1.2) +
+  scale_colour_manual(values = c("#1b9e77", "#e7298a", "#66a61e")) +
+  labs(title = expression(q(gamma*"'")), x = expression(gamma*"'"), y = "Relative weight", colour = NULL) +
+  coord_cartesian(ylim = c(0, 1.02), expand = FALSE) +
+  theme_minimal(base_size = 12)
+
+imm_K_plot <- ggplot(imm_K_df, aes(gamma, gamma_p, fill = K)) +
+  geom_raster() +
+  facet_wrap(~choice, nrow = 1) +
+  coord_equal(expand = FALSE) +
+  scale_fill_gradientn(colours = c("#fff7ec", "#fdd49e", "#fc8d59", "#d7301f", "#7f0000"), limits = c(0, 1)) +
+  labs(title = expression(K[gamma](gamma, gamma*"'")), x = expression(gamma), y = expression(gamma*"'")) +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid = element_blank())
+
+imm_r_plot
+imm_q_plot
+imm_K_plot
+```
+
+## One Concrete Factorization Choice
+
+```{r factorization}
+selected_s <- age_s_df |> filter(choice == "Child-amplified") |> transmute(alpha, value = value)
+selected_i <- age_i_df |> filter(choice == "School-age source") |> transmute(alpha_p, value = value)
+selected_Ka <- age_K_df |> filter(choice == "Intergenerational") |> select(alpha, alpha_p, K)
+selected_r <- imm_r_df |> filter(choice == "Threshold protection") |> transmute(gamma, value = value)
+selected_q <- imm_q_df |> filter(choice == "Residual shedding") |> transmute(gamma_p, value = value)
+selected_Kg <- imm_K_df |> filter(choice == "Low-immunity hotspot") |> select(gamma, gamma_p, K)
+
+B_alpha_df <- selected_Ka |>
+  left_join(selected_s, by = "alpha") |>
+  left_join(selected_i, by = "alpha_p") |>
+  mutate(B = value.x * K * value.y)
+
+B_gamma_df <- selected_Kg |>
+  left_join(selected_r, by = "gamma") |>
+  left_join(selected_q, by = "gamma_p") |>
+  mutate(B = value.x * K * value.y)
+
+B_alpha_plot <- ggplot(B_alpha_df, aes(alpha, alpha_p, fill = B)) +
+  geom_raster() +
+  coord_equal(expand = FALSE) +
+  scale_fill_gradientn(colours = c("#fff5f0", "#fcbba1", "#fb6a4a", "#cb181d", "#67000d")) +
+  labs(title = expression(B[alpha](alpha, alpha*"'") == s(alpha) %.% K[alpha](alpha, alpha*"'") %.% i(alpha*"'")), x = expression(alpha), y = expression(alpha*"'")) +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid = element_blank())
+
+B_gamma_plot <- ggplot(B_gamma_df, aes(gamma, gamma_p, fill = B)) +
+  geom_raster() +
+  coord_equal(expand = FALSE) +
+  scale_fill_gradientn(colours = c("#f7fcf5", "#c7e9c0", "#74c476", "#238b45", "#00441b")) +
+  labs(title = expression(B[gamma](gamma, gamma*"'") == r(gamma) %.% K[gamma](gamma, gamma*"'") %.% q(gamma*"'")), x = expression(gamma), y = expression(gamma*"'")) +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid = element_blank())
+
+B_alpha_plot
+B_gamma_plot
+```
+
+## Writing the Files Used in the LaTeX Note
+
+```{r write-files, eval=FALSE}
+source("contact_kernel_factorization.R")
+```
