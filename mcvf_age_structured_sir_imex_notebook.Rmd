@@ -214,16 +214,187 @@ stopifnot(cfl <= 1) # sanity check
 beta <- 40 # Transmission coefficient/scale - illustrative value for now
 gamma_rec <- 2 # Recovery rate - illustrative value for now 
 
-susceptibility <- 0.65 + 0.75 * exp(-((age - 4) / 6)^2) 
+#susceptibility <- 0.65 + 0.75 * exp(-((age - 4) / 6)^2) 
 # Gaussian shape - This example sets everyone to has baseline susceptibility of 0.65, with a childhood bump (susceptibility at 0.75) peaking at age 4, width ~6 years 
-infectiousness <- 0.55 + 0.95 * exp(-((age - 8) / 7)^2)
+#infectiousness <- 0.55 + 0.95 * exp(-((age - 8) / 7)^2)
 # Gaussian shape - This example sets everyone to has baseline infectiousness of 0.55, with a peak at 0.95 (high transmission in school-age children), peaking at age 8, width ~7 years
-mortality <- 0.008 + 0.06 / (1 + exp(-(age - 72) / 5))
+
+#Determine age-specific susceptibility and infectiousness from Jackson WAIFW matrix
+# WAIFW matrix (rows = susceptible i, cols = infectious j)
+waifw <- matrix(
+  c(0.02, 0.83, 0.22, 0.01,
+    0.01, 2.66, 0.03, 0.01,
+    0.96, 4.68, 0.29, 0.06,
+    0.66, 2.70, 0.17, 0.03),
+  nrow = 4, byrow = TRUE
+)
+
+age_mid <- c(0.5, 3, 7, 20)
+
+# Row sums → susceptibility profile (up to scaling)
+S_raw <- rowSums(waifw)
+S <- S_raw / max(S_raw)   # normalize to [0,1]
+
+# Column sums → infectiousness profile (up to scaling)
+I_raw <- colSums(waifw)
+I <- I_raw / max(I_raw)   # normalize to [0,1]
+
+cbind(age_mid, S, I)
+
+#susceptibility
+susceptibility_fx <- function(age) {
+  0.20 + 0.80 * exp(-0.5 * ((age - 7) / 6)^2)
+}
+
+infectiousness_fx <- function(age) {
+  0.01 + 0.99 * exp(-0.5 * ((age - 3) / 1.2)^2)
+}
+
+age <- seq(0, 40, by = 0.1)
+
+## Susc and inf curves from WAIFW
+susceptibility <- 0.20 + 0.80 * exp(-0.5 * ((age - 7) / 6)^2)
+
+infectiousness  <- 0.01 + 0.99 * exp(-0.5 * ((age - 3) / 1.2)^2)
+
+# Susceptibility and infectiousness plots
+
+df_plot <- data.frame(
+  age = age,
+  susceptibility,
+  infectiousness
+)
+library(ggplot2)
+
+df_both <- data.frame(
+  age = age,
+  susceptibility,
+  infectiousness
+)
+
+ggplot(df_both) +
+  geom_line(aes(x = age, y = susceptibility, color = "Susceptibility"),
+            linewidth = 1.3) +
+  geom_line(aes(x = age, y = infectiousness, color = "Infectiousness"),
+            linewidth = 1.3) +
+  scale_color_manual(values = c(
+    "Susceptibility" = "blue",
+    "Infectiousness" = "red"
+  )) +
+  labs(
+    title = "Susceptibility & Infectiousness by Age (Jackson et al WAIFW-based)",
+    x = "Age",
+    y = "Relative value",
+    color = ""
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    legend.position = "top"
+  )
+
+
+
+#mortality <- 0.008 + 0.06 / (1 + exp(-(age - 72) / 5))
 # Logistic (sigmoid curve) with background mortality of 0.008, steep increase starting around age 72, and width of about 5 years. This is just an illustrative shape for now. We could also do a more realistic U-shaped curve with high mortality in infancy and old age, but this is simpler for now.
-fertility_raw <- exp(-0.5 * ((age - 28) / 6)^2)
+
+#mortality, added by Conor
+age_group <- c("<1", "1-4", "5-9", "10-14", "15-19",
+               "20-24", "25-34", "35-44", "45-54",
+               "55-64", "65-74", "75-84", "85+")
+
+deaths <- c(113, 41, 12, 20, 56,
+            93, 157, 140, 165,
+            263, 357, 371, 241)
+
+pop <- c(10017, 35291, 37314, 38167, 35924,
+         34867, 62583, 44335, 29681,
+         23567, 14503, 6353, 1842)
+
+mx <- deaths / pop   # mortality rate per person-year
+
+age_mid <- c(0.5, 2.5, 7, 12, 17,
+             22, 30, 40, 50,
+             60, 70, 80, 90)
+
+logistic_mort <- function(age, a0, b, m0, L) {
+  m0 + L / (1 + exp(-(age - a0) / b))
+}
+
+logistic_mort <- function(age, a0, b, m0, L) {
+  m0 + L / (1 + exp(-(age - a0) / b))
+}
+
+mort_df <- data.frame(age_mid, mx)
+
+fit_mort <- nls(
+  mx ~ logistic_mort(age_mid, a0, b, m0, L),
+  data = mort_df,
+  start = list(a0 = 72, b = 5, m0 = 0.008, L = 0.06)
+)
+
+coef(fit_mort)
+
+pars <- coef(fit_mort)
+a0_hat  <- pars[["a0"]]
+b_hat   <- pars[["b"]]
+m0_hat  <- pars[["m0"]]
+L_hat   <- pars[["L"]]
+
+mortality <- m0_hat + L_hat / (1 + exp(-(age - a0_hat) / b_hat))
+
+age_smooth <- seq(0, 100, by = 0.1)
+mx_fit <- logistic_mort(age_smooth, a0_hat, b_hat, m0_hat, L_hat)
+
+
+
+# data frames for observed and fitted mortality
+mort_df <- data.frame(
+  age = age_mid,
+  mx  = mx
+)
+
+fit_df <- data.frame(
+  age = age_smooth,
+  mx  = mx_fit
+)
+
+mortplot <- ggplot() +
+  geom_point(data = mort_df,
+             aes(x = age, y = mx),
+             color = "red", size = 3) +
+  geom_line(data = fit_df,
+            aes(x = age, y = mx),
+            color = "blue", linewidth = 1.4) +
+  labs(
+    title = "Observed 1985 Navajo Mortality vs Logistic Fit",
+    x = "Age",
+    y = "Mortality rate (per person-year)"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+
+mortplot
+
+#fertility_raw <- exp(-0.5 * ((age - 28) / 6)^2)
 # Pure Gaussian shape with peak fertility of 1 at age 28 and width of about 6 years. 
 
+#fertility, added by Conor
+gaussian_fert <- function(age, mu, sigma, C) {
+  C * exp(-0.5 * ((age - mu) / sigma)^2)
+}
+
+mu_hat    <- 22.5
+sigma_hat <- 8.5
+C_hat     <- 0.21
+
+fertility <- gaussian_fert(age, mu_hat, sigma_hat, C_hat)
+
 N0_shape <- exp(-0.035 * age) 
+
 # Exponential decay shape for the initial age distribution. This is just an illustrative shape for now. We could also do a more realistic shape based on demographic data, but this is simpler for now. 
 N0_shape <- N0_shape / sum(N0_shape * da) # Normalize to density 
 
