@@ -293,6 +293,41 @@ ggplot(df_both) +
     legend.position = "top"
   )
 
+#fertility_raw <- exp(-0.5 * ((age - 28) / 6)^2)
+# Pure Gaussian shape with peak fertility of 1 at age 28 and width of about 6 years. 
+
+#fertility, added by Conor
+gaussian_fert <- function(age, mu, sigma, C) {
+  C * exp(-0.5 * ((age - mu) / sigma)^2)
+}
+
+mu_hat    <- 22.5
+sigma_hat <- 8.5
+C_hat     <- 0.21
+
+fertility <- gaussian_fert(age, mu_hat, sigma_hat, C_hat)
+
+N0_shape <- exp(-0.035 * age) 
+
+# Exponential decay shape for the initial age distribution. This is just an illustrative shape for now. We could also do a more realistic shape based on demographic data, but this is simpler for now. 
+N0_shape <- N0_shape / sum(N0_shape * da) # Normalize to density 
+
+fertility_scale <- sum(mortality * N0_shape * da) / sum(fertility_raw * N0_shape * da)
+# This scaling factor ensures that the initial population is at demographic equilibrium, meaning that the total number of births balances the total number of deaths. We compute it by taking the ratio of the total mortality (integrated over age) to the total raw fertility (also integrated over age), both weighted by the initial age distribution. This way, when we apply the fertility profile to the initial population, we get a birth influx that exactly offsets the deaths, keeping the population stable at the start of the simulation.
+
+fertility <- fertility_scale * fertility_raw
+# The final fertility profile is the raw Gaussian shape scaled by the factor computed above to ensure demographic equilibrium at the start of the simulation.
+
+#fertility plot by age
+df_fert <- data.frame(age = age, fertility = fertility)
+ggplot(df_fert) +
+  geom_line(aes(x = age, y = fertility), color = "purple", linewidth = 1.3) +
+  labs(
+    title = "Estimated Navajo Fertility Curve by Age, 1985",
+    x = "Age",
+    y = "Fertility rate (per person-year)"
+  ) +
+  theme_minimal(base_size = 14)
 
 
 #mortality <- 0.008 + 0.06 / (1 + exp(-(age - 72) / 5))
@@ -378,31 +413,6 @@ mortplot <- ggplot() +
   )
 
 mortplot
-
-#fertility_raw <- exp(-0.5 * ((age - 28) / 6)^2)
-# Pure Gaussian shape with peak fertility of 1 at age 28 and width of about 6 years. 
-
-#fertility, added by Conor
-gaussian_fert <- function(age, mu, sigma, C) {
-  C * exp(-0.5 * ((age - mu) / sigma)^2)
-}
-
-mu_hat    <- 22.5
-sigma_hat <- 8.5
-C_hat     <- 0.21
-
-fertility <- gaussian_fert(age, mu_hat, sigma_hat, C_hat)
-
-N0_shape <- exp(-0.035 * age) 
-
-# Exponential decay shape for the initial age distribution. This is just an illustrative shape for now. We could also do a more realistic shape based on demographic data, but this is simpler for now. 
-N0_shape <- N0_shape / sum(N0_shape * da) # Normalize to density 
-
-fertility_scale <- sum(mortality * N0_shape * da) / sum(fertility_raw * N0_shape * da)
-# This scaling factor ensures that the initial population is at demographic equilibrium, meaning that the total number of births balances the total number of deaths. We compute it by taking the ratio of the total mortality (integrated over age) to the total raw fertility (also integrated over age), both weighted by the initial age distribution. This way, when we apply the fertility profile to the initial population, we get a birth influx that exactly offsets the deaths, keeping the population stable at the start of the simulation.
-
-fertility <- fertility_scale * fertility_raw
-# The final fertility profile is the raw Gaussian shape scaled by the factor computed above to ensure demographic equilibrium at the start of the simulation.
 
 param_table <- tibble(
   quantity = c(
