@@ -63,10 +63,13 @@ beta <- 40 # Transmission coefficient/scale - illustrative value for now [MAY NE
 
 susceptibility <- 0.65 + 0.75 * exp(-((age - 4) / 6)^2) 
 # Gaussian shape - This example sets everyone to has baseline susceptibility of 0.65, with a childhood bump (susceptibility at 0.75) peaking at age 4, width ~6 years 
+
 infectiousness <- 0.55 + 0.95 * exp(-((age - 8) / 7)^2)
 # Gaussian shape - This example sets everyone to has baseline infectiousness of 0.55, with a peak at 0.95 (high transmission in school-age children), peaking at age 8, width ~7 years
+
 mortality <- 0.008 + 0.06 / (1 + exp(-(age - 72) / 5))
 # Logistic (sigmoid curve) with background mortality of 0.008, steep increase starting around age 72, and width of about 5 years. This is just an illustrative shape for now. We could also do a more realistic U-shaped curve with high mortality in infancy and old age, but this is simpler for now.
+
 fertility_raw <- exp(-0.5 * ((age - 22) / 6)^2)
 # Pure Gaussian shape with peak fertility of 1 at age 22 and width of about 6 years (common fertility curve adjusted to 1988 Navajo data)
 
@@ -96,19 +99,16 @@ frac_maternal_high <- 0.79
 frac_maternal_low <- 0.00
 frac_maternal_none <- 1 - frac_maternal_high - frac_maternal_low
 
-kable(param_table, digits = 3)
-
 
 # DEFINING IMMUNITY CLASSES AND KERNEL
 immunity_classes <- c("none", "low", "high")
 n_immunity <- length(immunity_classes)
 
 # Susceptibility Multiplier by immunity class (kernel); how vulnerable someone in each class is to getting infected relative to a fully susceptible person
-# Currently have inputed illustrative numbers (40%, 4%) but can change later
 s_immunity <- c(none = 1.0, low = 1.0, high = 0.04)
 alpha_L <- 1 - s_immunity["low"] # efficacy of low antibody against carriage acquisition
 alpha_H <- 1 - s_immunity["high"] # efficacy of high antibody against carriage acquisition
-#LOW s_immunity adjusted from 0.4 to 1.0 per Jackson et al. (low antibody does not protect against carriage, only high antibody) and HIGH s_immunity slightly adjusted from 0.05 to 0.04 per Jackson et al.
+#LOW s_immunity set to be 1.0 per Jackson et al. (low antibody does not protect against carriage, only high antibody) and HIGH s_immunity set to 0.04 per Jackson et al.
 
 # NEW: efficacy of antibody against progression from carriage to invasive disease.
 # These are conceptually distinct from alpha_L/alpha_H (protection against acquiring
@@ -118,10 +118,6 @@ beta_L <- 0.90  # efficacy of low antibody in preventing invasive disease among 
 beta_H <- 0.98  # efficacy of high antibody in preventing invasive disease among carriers
 #updated to 0.90 and 0.98 for low and high antibody, respectively, protection against invasive disease
 
-#OLD WANING RATE CODE, not age dependent
-#waning_rate <- c(none = 0, low = 0.5, high = 0.1)
-#wane_high_to_low <- waning_rate["high"]
-#wane_low_to_none <- waning_rate["low"]
 
 #NEW WANING RATE CODE, per Jackson et al.
 # High to Low antibody waning depends on host age:
@@ -135,9 +131,9 @@ wane_high_to_low <- dplyr::case_when(
 wane_low_to_none <- 0.0939
 
 rho_C <- 2.1759 # rate of recovery from carriage (1/duration of carriage episode)
-# updated from 6 based on duration of carriage reported by Jackson et al.
+# Based on duration of carriage reported by Jackson et al.
 rho_I <- 33.2067 # rate of recovery from invasive disease (1/duration of illness)
-# updated from 4 based on duration of carriage reported by Jackson et al.
+# Based on duration of carriage reported by Jackson et al. 
 
 
 # External Force of Infection
@@ -625,8 +621,15 @@ ggplot(summary_aux, aes(time, value)) +
 
 ```{r age-profiles}
 snapshot_long <- snapshots_df |>
-  pivot_longer(cols = c(S_none, S_low, S_high, C_none, C_low, C_high, D), names_to = "compartment", values_to = "density") |>
-  mutate(time_label = paste0("t = ", format(round(time, 1), nsmall = 1)))
+  pivot_longer(
+    cols = c(S_none_count, S_low_count, S_high_count,
+             C_none_count, C_low_count, C_high_count, D_count),
+    names_to = "compartment", values_to = "density"
+  ) |>
+  mutate(
+    compartment = gsub("_count", "", compartment),
+    time_label  = paste0("t = ", format(round(time, 1), nsmall = 1))
+  )
 
 ggplot(snapshot_long, aes(age, density, colour = compartment)) +
   geom_line(linewidth = 0.9) +
@@ -649,7 +652,7 @@ ggplot(snapshot_long, aes(age, density, colour = compartment)) +
 These heatmaps are often the easiest way to see what an age-structured McVF model is doing.
 
 ```{r disease-heatmap}
-ggplot(heatmap_df, aes(time, age, fill = D)) +
+ggplot(heatmap_df, aes(time, age, fill = D_cases)) +
   geom_raster(interpolate = FALSE) +
   scale_fill_gradient(low = "#f7fbff", high = "#08306b") +
   labs(
@@ -661,7 +664,7 @@ ggplot(heatmap_df, aes(time, age, fill = D)) +
 ```
 
 ```{r carriage-heatmap}
-ggplot(heatmap_df, aes(time, age, fill = carriage)) +
+ggplot(heatmap_df, aes(time, age, fill = carriage_cases)) +
   geom_raster(interpolate = FALSE) +
   scale_fill_gradient(low = "#fff5eb", high = "#7f2704") +
   labs(
