@@ -1,0 +1,691 @@
+---
+title: "A McKendrick-von Foerster Age-Structured SIRS Model With Immunity in R"
+author: ""
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 9,
+  fig.height = 5.5,
+  fig.retina = 2
+)
+
+.libPaths(c("C:/Users/nhdinh/jh", .libPaths()))
+
+library(deSolve)
+library(ReacTran)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(knitr)
+
+theme_set(theme_minimal(base_size = 13))
+```
+
+```{r grids-and-parameters}
+age_max <- 80 # Setting oldest age in population to 80 years [MAY WANT TO CHANGE THIS?]
+da <- 0.5 # Width of one age bin in years
+dt <- 0.1 # Size of one time step in years
+time_max <- 12 # Simulation horizon in years
+
+grid <- setup.grid.1D(x.up = 0, L = age_max, N = round(age_max / da))
+age <- grid$x.mid # Age values at bin centers
+time <- seq(0, time_max, by = dt)
+
+n_age <- length(age) # number of age bins
+cfl <- dt / da 
+# Set CFL condition: Do not let one numerical time step age people by more than about one full age bin. 
+stopifnot(cfl <= 1) # sanity check 
+
+#Population scale, convert relative densities to pop counts
+N_target <- 200000  # Total population size 200,000 people, approximate population of Navajo Nation in 1988
+
+# Age distribution/shape
+N0_shape <- exp(-0.035 * age) 
+N0_shape <- N0_shape / sum(N0_shape * da)  # Normalized baseline density (integrates to 1)
+
+# Population density scaled to N_target persons
+N0_density <- N0_shape * N_target
+
+
+beta <- 40 # Transmission coefficient/scale - illustrative value for now [MAY NEED TO UPDATE]
+#represents overall contact volume and per-contact Hib transmission probability
+
+susceptibility <- 0.65 + 0.75 * exp(-((age - 4) / 6)^2) 
+# Gaussian shape - This example sets everyone to has baseline susceptibility of 0.65, with a childhood bump (susceptibility at 0.75) peaking at age 4, width ~6 years 
+infectiousness <- 0.55 + 0.95 * exp(-((age - 8) / 7)^2)
+# Gaussian shape - This example sets everyone to has baseline infectiousness of 0.55, with a peak at 0.95 (high transmission in school-age children), peaking at age 8, width ~7 years
+mortality <- 0.008 + 0.06 / (1 + exp(-(age - 72) / 5))
+# Logistic (sigmoid curve) with background mortality of 0.008, steep increase starting around age 72, and width of about 5 years. This is just an illustrative shape for now. We could also do a more realistic U-shaped curve with high mortality in infancy and old age, but this is simpler for now.
+fertility_raw <- exp(-0.5 * ((age - 22) / 6)^2)
+# Pure Gaussian shape with peak fertility of 1 at age 22 and width of about 6 years (common fertility curve adjusted to 1988 Navajo data)
+
+fertility_scale <- sum(mortality * N0_shape * da) / sum(fertility_raw * N0_shape * da)
+# This scaling factor ensures that the initial population is at demographic equilibrium, meaning that the total number of births balances the total number of deaths. We compute it by taking the ratio of the total mortality (integrated over age) to the total raw fertility (also integrated over age), both weighted by the initial age distribution. This way, when we apply the fertility profile to the initial population, we get a birth influx that exactly offsets the deaths, keeping the population stable at the start of the simulation.
+
+fertility <- fertility_scale * fertility_raw
+# The final fertility profile is the raw Gaussian shape scaled by the factor computed above to ensure demographic equilibrium at the start of the simulation.
+
+# NEW: Age-dependent rate of progression from carriage to invasive disease, sigma(a)
+## Aligned with 4-month maternal antibody clearance & 4-12 month peak vulnerability and reflecting the epidemiology of invasive Hib disease being concentrated in young children.
+
+# Parameters
+sigma_peak     <- 0.025   # Peak progression rate per year (~2.5% progression risk/yr if non-immune)
+sigma_baseline <- 0.0001  # Minimal baseline progression risk for older age groups
+a_peak         <- 0.50    # Peak age (~6 months, onset starts after ~4 mo loss of maternal IgG)
+width_s        <- 0.55    # Shape parameter controlling age-width of susceptibility window
+
+# Calculate log-normal shape centered around 6 months (0.5 years)
+# Add small offset (1e-4) to prevent log(0) at age = 0
+sigma <- sigma_baseline + sigma_peak * exp(-((log(age + 1e-4) - log(a_peak))^2) / (2 * width_s^2))
+
+
+# Maternal antibody fractions; proportion of newborns that enter in each immunity status. Currently illustrative. Also need to fix so that rate at which maternal antibodies wane is faster than normal antibody waning effect. 
+
+frac_maternal_high <- 0.79
+frac_maternal_low <- 0.00
+frac_maternal_none <- 1 - frac_maternal_high - frac_maternal_low
+
+kable(param_table, digits = 3)
+
+
+# DEFINING IMMUNITY CLASSES AND KERNEL
+immunity_classes <- c("none", "low", "high")
+n_immunity <- length(immunity_classes)
+
+# Susceptibility Multiplier by immunity class (kernel); how vulnerable someone in each class is to getting infected relative to a fully susceptible person
+# Currently have inputed illustrative numbers (40%, 4%) but can change later
+s_immunity <- c(none = 1.0, low = 1.0, high = 0.04)
+alpha_L <- 1 - s_immunity["low"] # efficacy of low antibody against carriage acquisition
+alpha_H <- 1 - s_immunity["high"] # efficacy of high antibody against carriage acquisition
+#LOW s_immunity adjusted from 0.4 to 1.0 per Jackson et al. (low antibody does not protect against carriage, only high antibody) and HIGH s_immunity slightly adjusted from 0.05 to 0.04 per Jackson et al.
+
+# NEW: efficacy of antibody against progression from carriage to invasive disease.
+# These are conceptually distinct from alpha_L/alpha_H (protection against acquiring
+# carriage) - illustrative values only, set higher than the carriage-efficacies since
+# antibody is generally more protective against invasive disease than against carriage.
+beta_L <- 0.90  # efficacy of low antibody in preventing invasive disease among carriers
+beta_H <- 0.98  # efficacy of high antibody in preventing invasive disease among carriers
+#updated to 0.90 and 0.98 for low and high antibody, respectively, protection against invasive disease
+
+#OLD WANING RATE CODE, not age dependent
+#waning_rate <- c(none = 0, low = 0.5, high = 0.1)
+#wane_high_to_low <- waning_rate["high"]
+#wane_low_to_none <- waning_rate["low"]
+
+#NEW WANING RATE CODE, per Jackson et al.
+# High to Low antibody waning depends on host age:
+# <1 year: 4.9987/yr | 1-2 years: 0.3287/yr | >=2 years: 0.1983/yr
+wane_high_to_low <- dplyr::case_when(
+  age < 1.0 ~ 4.9987,
+  age < 2.0 ~ 0.3287,
+  TRUE      ~ 0.1983
+)
+# Constant waning rate for Low to No antibody waning across all ages
+wane_low_to_none <- 0.0939
+
+rho_C <- 2.1759 # rate of recovery from carriage (1/duration of carriage episode)
+# updated from 6 based on duration of carriage reported by Jackson et al.
+rho_I <- 33.2067 # rate of recovery from invasive disease (1/duration of illness)
+# updated from 4 based on duration of carriage reported by Jackson et al.
+
+
+# External Force of Infection
+lambda_ext <- 0.0005
+
+# Vaccine Efficacy Baseline (for subsequent policy/vaccination adjustments/simulations)
+vaccine_efficacy <- ifelse(age < 1.0, 0.99, 1.00)
+
+param_table <- tibble(
+  Parameter = c("Population Target N", "Age Bin Width da", "Time Step dt", "Simulation Horizon", 
+                "CFL Number", "Carriage Recovery (rho_C)", "Disease Recovery (rho_I)", 
+                "External FOI (lambda_ext)"),
+  Value = c(N_target, da, dt, time_max, cfl, rho_C, rho_I, lambda_ext)
+)
+kable(param_table, digits = 4)
+
+```
+
+```{r ingredient-plots}
+ingredient_df <- tibble(
+  age = age,
+  susceptibility = susceptibility,
+  infectiousness = infectiousness,
+  mortality = mortality,
+  fertility = fertility,
+  sigma = sigma
+) |>
+  pivot_longer(-age, names_to = "quantity", values_to = "value")
+
+ggplot(ingredient_df, aes(age, value)) +
+  geom_line(linewidth = 1.0, colour = "#1f78b4") +
+  facet_wrap(~ quantity, scales = "free_y", ncol = 2) +
+  labs(
+    title = "Age-Dependent Biological & Demographic Inputs",
+    x = "Age (years)", y = "Value"
+  )
+```
+
+# Initial Condition
+
+```{r new-initial-condition}
+# CALIBRATED INITIAL CONDITIONS based on Empirical Pre-Vaccine Hib Data from Navajo, White Mountain Apache, and Alaska Native populations)
+
+# 1. Age-varying Maternal Antibody Decay
+# 79% of newborns start with high maternal IgG, clearing rapidly by 4 months (~0.33 yrs)
+frac_maternal_high <- 0.79
+frac_maternal_low  <- 0.00
+frac_maternal_none <- 1 - frac_maternal_high - frac_maternal_low
+
+# Steeper decay: at age = 0.33 (4 months), exp(-0.33/0.12) ~ 0.06 (over 90% lost)
+frac_high_by_age <- frac_maternal_high * exp(-age / 0.12)
+frac_low_by_age  <- frac_maternal_low  * exp(-age / 0.12) + 0.10 * exp(-((age - 1.5) / 1.0)^2)
+frac_none_by_age <- pmax(1 - frac_high_by_age - frac_low_by_age, 0)
+
+
+# 2. Empirical Baseline Carriage Prevalence Function P_C(a)
+# - Michaels et al. (1976): ~0.7% under 6 months (0.5 yrs), 3-5% across childhood
+# - Singleton (2006) / Millar (2000): ~1.5% in ages 1-4, up to 3.4-5.0% in older childhood
+carriage_prob <- dplyr::case_when(
+  age < 0.5 ~ 0.007,                                    # < 6 months (~0.7%)
+  age >= 0.5 & age < 5.0 ~ 0.015 + 0.020 * (age / 5),  # 0.5 - 5 yrs (1.5% -> 3.5%)
+  age >= 5.0 & age < 10.0 ~ 0.034,                      # 5 - 9 yrs (3.4%)
+  TRUE ~ 0.010                                          # Adults (~1.0%)
+)
+
+# Total Carriage Density across age
+C0_total <- N0_density * carriage_prob
+D0       <- 0.002 * N0_density * exp(-0.5 * ((age - 0.75) / 0.35)^2)
+S0_total <- pmax(N0_density - C0_total - D0, 0)
+
+S0 <- matrix(0, nrow = n_age, ncol = n_immunity, dimnames = list(NULL, immunity_classes))
+C0 <- matrix(0, nrow = n_age, ncol = n_immunity, dimnames = list(NULL, immunity_classes))
+
+S0[, "none"] <- S0_total * frac_none_by_age
+S0[, "low"]  <- S0_total * frac_low_by_age
+S0[, "high"] <- S0_total * frac_high_by_age
+
+C0[, "none"] <- C0_total * frac_none_by_age
+C0[, "low"]  <- C0_total * frac_low_by_age
+C0[, "high"] <- C0_total * frac_high_by_age
+
+# Plot Initial Distribution in Absolute Counts per Bin
+initial_counts_df <- tibble(
+  age = age,
+  S_none = S0[, "none"] * da,
+  S_low  = S0[, "low"]  * da,
+  S_high = S0[, "high"] * da,
+  C_none = C0[, "none"] * da,
+  C_low  = C0[, "low"]  * da,
+  C_high = C0[, "high"] * da,
+  D      = D0 * da
+) |>
+  pivot_longer(-age, names_to = "compartment", values_to = "count")
+
+ggplot(initial_counts_df, aes(age, count, colour = compartment)) +
+  geom_line(linewidth = 1.0) +
+  scale_colour_manual(values = c(
+    S_none = "#1b9e77", S_low = "#66c2a5", S_high = "#a6d854",
+    C_none = "#fdae61", C_low = "#f46d43", C_high = "#d73027",
+    D      = "#7570b3"
+  )) +
+  labs(
+    title = paste0("Initial Population Counts per ", da, "-Year Age Bin"),
+    x = "Age (years)", y = "Number of Individuals"
+  )
+
+```
+
+# Core Numerical Pieces
+
+## Force of infection and birth influx
+The force of infection is now driven by **total carriers**, and the population total in the denominator now includes `C` and `D` as well as `S`.
+
+```{r forcing-functions-and-reaction-step}
+force_of_infection <- function(S, C, D, beta, susceptibility, infectiousness, da, lambda_ext = 0.0005) {
+  total_S <- rowSums(S)
+  total_C <- rowSums(C)
+  total_pop <- sum((total_S + total_C + D) * da)
+  infectious_pressure <- sum(infectiousness * total_C * da) / max(total_pop, 1e-12)
+  
+  (beta * susceptibility * infectious_pressure) + lambda_ext
+}
+
+birth_influx <- function(S, C, D, fertility, da) {
+  total_S <- rowSums(S)
+  total_C <- rowSums(C)
+  sum(fertility * (total_S + total_C + D) * da)
+}
+
+age_transport_step <- function(u, boundary_value, dt, grid) {
+  transport_change <- tran.1D(
+    C = u, C.up = boundary_value, C.down = tail(u, 1),
+    v = 1, D = 0, dx = grid
+  )$dC
+  u + dt * transport_change
+}
+
+age_transport_step_matrix <- function(M, boundary_values, dt, grid) {
+  out <- M
+  for (j in seq_len(ncol(M))) {
+    out[, j] <- age_transport_step(M[, j], boundary_values[j], dt, grid)
+  }
+  out
+}
+
+pack_state <- function(S, C, D) {
+  c(as.vector(S), as.vector(C), D)
+}
+
+unpack_state <- function(y, n_age, n_immunity, immunity_classes) {
+  n_block <- n_age * n_immunity
+  S <- matrix(y[1:n_block], nrow = n_age, ncol = n_immunity, dimnames = list(NULL, immunity_classes))
+  C <- matrix(y[(n_block + 1):(2 * n_block)], nrow = n_age, ncol = n_immunity, dimnames = list(NULL, immunity_classes))
+  D <- y[(2 * n_block + 1):(2 * n_block + n_age)]
+  list(S = S, C = C, D = D)
+}
+
+reaction_rhs <- function(t, y, parms) {
+  with(parms, {
+    state <- unpack_state(y, n_age, n_immunity, immunity_classes)
+    
+    S_none <- state$S[, "none"]
+    S_low  <- state$S[, "low"]
+    S_high <- state$S[, "high"]
+    C_none <- state$C[, "none"]
+    C_low  <- state$C[, "low"]
+    C_high <- state$C[, "high"]
+    D      <- state$D
+    
+    lambda_none <- lambda 
+    lambda_low  <- lambda * (1 - alpha_L)
+    lambda_high <- lambda * (1 - alpha_H)
+    
+    sigma_none <- sigma
+    sigma_low  <- sigma * (1 - beta_L)
+    sigma_high <- sigma * (1 - beta_H)
+    
+    dS_none <- -(lambda_none + mortality) * S_none + wane_low_to_none * S_low
+    dS_low  <- -(lambda_low + wane_low_to_none + mortality) * S_low + wane_high_to_low * S_high 
+    dS_high <- -(lambda_high + wane_high_to_low + mortality) * S_high + (C_none + C_low + C_high) * rho_C + rho_I * D
+    
+    dC_none <- lambda_none * S_none - (sigma_none + rho_C + mortality) * C_none
+    dC_low  <- lambda_low * S_low - (sigma_low + rho_C + mortality) * C_low
+    dC_high <- lambda_high * S_high - (sigma_high + rho_C + mortality) * C_high
+    
+    disease_inflow <- sigma_none * C_none + sigma_low * C_low + sigma_high * C_high
+    dD             <- disease_inflow - (rho_I + mortality) * D
+    
+    dS <- cbind(none = dS_none, low = dS_low, high = dS_high)
+    dC <- cbind(none = dC_none, low = dC_low, high = dC_high)
+    
+    list(c(as.vector(dS), as.vector(dC), dD))
+  })
+}
+
+reaction_step_desolve <- function(
+  S_star, C_star, D_star, lambda, sigma, mortality, dt, n_age, n_immunity, 
+  immunity_classes, alpha_L, alpha_H, beta_L, beta_H, 
+  wane_high_to_low, wane_low_to_none, rho_C, rho_I
+) {
+  y_star <- pack_state(S_star, C_star, D_star)
+
+  sol <- ode(
+    y = y_star, times = c(0, dt), func = reaction_rhs,
+    parms = list(
+      lambda = lambda, sigma = sigma, mortality = mortality,
+      n_age = n_age, n_immunity = n_immunity, immunity_classes = immunity_classes,
+      alpha_L = alpha_L, alpha_H = alpha_H, beta_L = beta_L, beta_H = beta_H,
+      wane_high_to_low = wane_high_to_low, wane_low_to_none = wane_low_to_none,
+      rho_C = rho_C, rho_I = rho_I
+    ),
+    method = "radau", rtol = 1e-6, atol = 1e-8
+  )
+
+  unpack_state(sol[2, -1], n_age, n_immunity, immunity_classes)
+}
+
+```
+
+
+```{r simulator}
+simulate_mcvf_sir_imex <- function(
+  S0, C0, D0, age, time, da, dt, grid, beta, sigma,
+  susceptibility, infectiousness, fertility, mortality, 
+  n_immunity, immunity_classes, alpha_L, alpha_H, beta_L, beta_H, 
+  wane_high_to_low, wane_low_to_none, rho_C, rho_I,
+  frac_maternal_none, frac_maternal_low, frac_maternal_high,
+  snapshot_times = c(0, 1, 2, 4, 8, 12), heatmap_stride = 2
+) {
+  S <- S0
+  C <- C0
+  D <- D0
+  
+  n_age <- length(age)
+  summary_store  <- vector("list", length(time))
+  snapshot_store <- list()
+  heatmap_store  <- list()
+  snap_counter   <- 1
+
+  for (n in seq_along(time)) {
+    t_now <- time[n]
+
+    lambda_now <- force_of_infection(S, C, D, beta, susceptibility, infectiousness, da, lambda_ext)
+    births_now <- birth_influx(S, C, D, fertility, da)
+
+    total_S_by_class <- colSums(S * da)
+    total_S          <- sum(total_S_by_class)
+    
+    total_C_by_class <- colSums(C * da)
+    total_C          <- sum(total_C_by_class)
+    
+    total_D <- sum(D * da)
+    total_N <- total_S + total_C + total_D
+    
+    carriage_incidence_now <- sum(lambda_now * rowSums(S) * da)
+    disease_incidence_now  <- sum(sigma * rowSums(C) * da)
+
+    summary_store[[n]] <- tibble(
+      time = t_now, S = total_S,
+      S_none = total_S_by_class["none"], S_low = total_S_by_class["low"], S_high = total_S_by_class["high"],
+      C = total_C,
+      C_none = total_C_by_class["none"], C_low = total_C_by_class["low"], C_high = total_C_by_class["high"],
+      D = total_D, N = total_N, births = births_now,
+      carriage_incidence = carriage_incidence_now, disease_incidence = disease_incidence_now,
+      mean_lambda = mean(lambda_now)
+    )
+
+    if (any(abs(t_now - snapshot_times) < dt / 2)) {
+      snapshot_store[[snap_counter]] <- tibble(
+        time = t_now, age = age,
+        # Absolute counts per bin (Density * da)
+        S_none_count = S[, "none"] * da, S_low_count = S[, "low"] * da, S_high_count = S[, "high"] * da,
+        C_none_count = C[, "none"] * da, C_low_count = C[, "low"] * da, C_high_count = C[, "high"] * da,
+        D_count      = D * da,
+        total_carriage_count = rowSums(C) * da,
+        total_disease_count  = D * da,
+        # Annualized incident cases per bin
+        new_disease_cases_per_year = (sigma * rowSums(C)) * da
+      )
+      snap_counter <- snap_counter + 1
+    }
+
+    if ((n - 1) %% heatmap_stride == 0) {
+      heatmap_store[[length(heatmap_store) + 1]] <- tibble(
+        time = t_now, age = age,
+        D_cases = D * da,
+        carriage_cases = rowSums(C) * da,
+        prevalence_disease = D / pmax(rowSums(S) + rowSums(C) + D, 1e-12),
+        prevalence_carriage = rowSums(C) / pmax(rowSums(S) + rowSums(C) + D, 1e-12)
+      )
+    }
+
+    if (n == length(time)) break
+    
+    # Boundary values at Age 0
+    S_boundary <- c(none = births_now * frac_maternal_none,
+                    low  = births_now * frac_maternal_low,
+                    high = births_now * frac_maternal_high)[immunity_classes]
+    C_boundary <- c(none = 0, low = 0, high = 0)[immunity_classes]
+    D_boundary <- 0
+
+    S_star <- age_transport_step_matrix(S, S_boundary, dt, grid)
+    C_star <- age_transport_step_matrix(C, C_boundary, dt, grid)
+    D_star <- age_transport_step(D, D_boundary, dt, grid)
+
+    react <- reaction_step_desolve(
+      S_star = S_star, C_star = C_star, D_star = D_star,
+      lambda = lambda_now, sigma = sigma, mortality = mortality, dt = dt,
+      n_age = n_age, n_immunity = n_immunity, immunity_classes = immunity_classes,
+      alpha_L = alpha_L, alpha_H = alpha_H, beta_L = beta_L, beta_H = beta_H,
+      wane_high_to_low = wane_high_to_low, wane_low_to_none = wane_low_to_none,
+      rho_C = rho_C, rho_I = rho_I
+    )
+
+    S <- pmax(react$S, 0)
+    C <- pmax(react$C, 0)
+    D <- pmax(react$D, 0)
+  }
+
+  list(
+    summary   = bind_rows(summary_store),
+    snapshots = bind_rows(snapshot_store),
+    heatmap   = bind_rows(heatmap_store)
+  )
+}
+
+```
+
+# Run the Simulation
+
+```{r run-simulation}
+out <- simulate_mcvf_sir_imex(
+  S0 = S0, C0 = C0, D0 = D0, age = age, time = time, da = da, dt = dt, grid = grid,
+  beta = beta, sigma = sigma, susceptibility = susceptibility, infectiousness = infectiousness,
+  fertility = fertility, mortality = mortality, n_immunity = n_immunity,
+  immunity_classes = immunity_classes, alpha_L = alpha_L, alpha_H = alpha_H,
+  beta_L = beta_L, beta_H = beta_H, wane_high_to_low = wane_high_to_low,
+  wane_low_to_none = wane_low_to_none, rho_C = rho_C, rho_I = rho_I,
+  frac_maternal_none = frac_maternal_none, frac_maternal_low = frac_maternal_low,
+  frac_maternal_high = frac_maternal_high, snapshot_times = c(0, 1, 2, 4, 8, 12),
+  heatmap_stride = 2
+)
+
+summary_df   <- out$summary
+snapshots_df <- out$snapshots
+heatmap_df   <- out$heatmap
+
+kable(head(summary_df, 8), digits = 2)
+
+```
+
+
+#pop totals over time
+```{r pop-totals}
+summary_long <- summary_df |>
+  select(time, S, C, D) |>
+  pivot_longer(-time, names_to = "compartment", values_to = "persons")
+
+ggplot(summary_long, aes(time, persons, colour = compartment)) +
+  geom_line(linewidth = 1.0) +
+  scale_colour_manual(values = c(S = "#1b9e77", C = "#d95f02", D = "#7570b3")) +
+  labs(
+    title = paste0("Total Population Mass Across Compartments (N = ", format(N_target, big.mark=","), ")"),
+    x = "Time (years)", y = "Total Persons"
+  )
+
+```
+
+#incidence counts
+```{r incidence-counts}
+summary_aux <- summary_df |>
+  select(time, carriage_incidence, disease_incidence, births) |>
+  pivot_longer(-time, names_to = "quantity", values_to = "value")
+
+ggplot(summary_aux, aes(time, value)) +
+  geom_line(linewidth = 1.0, colour = "#2c7fb8") +
+  facet_wrap(~ quantity, scales = "free_y", ncol = 1) +
+  labs(
+    title = "Annualized Absolute Incidence Counts & Births",
+    x = "Time (years)", y = "Persons / Year"
+  )
+
+```
+
+#age-specific counts over time
+```{r age-counts}
+snapshot_counts_long <- snapshots_df |>
+  pivot_longer(
+    cols = c(S_none_count, S_low_count, S_high_count, 
+             C_none_count, C_low_count, C_high_count, D_count),
+    names_to = "compartment", values_to = "count"
+  ) |>
+  mutate(
+    compartment = gsub("_count", "", compartment),
+    time_label  = paste0("t = ", format(round(time, 1), nsmall = 1))
+  )
+
+ggplot(snapshot_counts_long, aes(age, count, colour = compartment)) +
+  geom_line(linewidth = 0.9) +
+  facet_grid(compartment ~ time_label, scales = "free_y") +
+  scale_colour_manual(values = c(
+    S_none = "#1b9e77", S_low = "#66c2a5", S_high = "#a6d854",
+    C_none = "#fdae61", C_low = "#f46d43", C_high = "#d73027",
+    D      = "#7570b3"
+  )) +
+  labs(
+    title = paste0("Age Profiles by Compartment (Counts per ", da, "-Year Bin)"),
+    x = "Age (years)", y = "Number of Individuals"
+  ) +
+  theme(legend.position = "none")
+
+```
+
+#childhood (<5 y-o) invasive disease cases
+```{r child-cases}
+snapshots_df |>
+  filter(age <= 5) |>
+  mutate(time_label = paste0("t = ", format(round(time, 1), nsmall = 1))) |>
+  ggplot(aes(age, new_disease_cases_per_year, colour = time_label)) +
+  geom_line(linewidth = 1.1) +
+  labs(
+    title = "Annualized New Invasive Hib Cases by Age (<5 Years)",
+    subtitle = "Peak vulnerability driven by maternal IgG decay at 4 months",
+    x = "Age (years)", y = "New Cases / Year (per Bin)", colour = "Time Step"
+  )
+
+```
+
+#cases heatmap (absolute)
+```{r heatmap-cases}
+ggplot(heatmap_df, aes(time, age, fill = D_cases)) +
+  geom_raster(interpolate = FALSE) +
+  scale_fill_gradient(low = "#f7fbff", high = "#08306b") +
+  labs(
+    title = paste0("Invasive Disease Cases (D) per ", da, "-Year Age Bin"),
+    x = "Time (years)", y = "Age (years)", fill = "Cases"
+  )
+
+ggplot(heatmap_df, aes(time, age, fill = prevalence_disease)) +
+  geom_raster(interpolate = FALSE) +
+  scale_fill_gradient(low = "#fff5eb", high = "#7f2704") +
+  labs(
+    title = "Age-Specific Invasive Disease Prevalence Profile",
+    x = "Time (years)", y = "Age (years)", fill = "Prevalence"
+  )
+
+```
+
+
+# Aggregate Dynamics
+
+These are the total susceptible, infectious, and recovered masses after integrating over age.
+
+```{r aggregate-dynamics}
+summary_long <- summary_df |>
+  select(time, S, C, D) |>
+  pivot_longer(-time, names_to = "compartment", values_to = "mass")
+
+ggplot(summary_long, aes(time, mass, colour = compartment)) +
+  geom_line(linewidth = 1.0) +
+  scale_colour_manual(values = c(S = "#1b9e77", C = "#d95f02", D = "#7570b3")) +
+  labs(
+    title = "Aggregate SCD dynamics",
+    x = "Time (years)",
+    y = "Total mass"
+  )
+```
+
+```{r incidence-and-births}
+summary_aux <- summary_df |>
+  select(time, carriage_incidence, disease_incidence, births, mean_lambda) |>
+  pivot_longer(-time, names_to = "quantity", values_to = "value")
+
+ggplot(summary_aux, aes(time, value)) +
+  geom_line(linewidth = 1.0, colour = "#2c7fb8") +
+  facet_wrap(~ quantity, scales = "free_y", ncol = 1) +
+  labs(
+    title = "Carriage/disease incidence, births, and mean force of infection",
+    x = "Time (years)",
+    y = NULL
+  )
+```
+
+# Age Profiles at Selected Times
+
+```{r age-profiles}
+snapshot_long <- snapshots_df |>
+  pivot_longer(cols = c(S_none, S_low, S_high, C_none, C_low, C_high, D), names_to = "compartment", values_to = "density") |>
+  mutate(time_label = paste0("t = ", format(round(time, 1), nsmall = 1)))
+
+ggplot(snapshot_long, aes(age, density, colour = compartment)) +
+  geom_line(linewidth = 0.9) +
+  facet_grid(compartment ~ time_label, scales = "free_y") +
+  scale_colour_manual(values = c(
+  S_none = "#1b9e77", S_low = "#66c2a5", S_high = "#a6d854",
+    C_none = "#fdae61", C_low = "#f46d43", C_high = "#d73027",
+    D = "#7570b3"
+)) +
+  labs(
+    title = "Age profiles of S, C, and D at selected times",
+    x = "Age (years)",
+    y = "Density"
+  ) +
+  theme(legend.position = "none")
+```
+
+# Heatmaps
+
+These heatmaps are often the easiest way to see what an age-structured McVF model is doing.
+
+```{r disease-heatmap}
+ggplot(heatmap_df, aes(time, age, fill = D)) +
+  geom_raster(interpolate = FALSE) +
+  scale_fill_gradient(low = "#f7fbff", high = "#08306b") +
+  labs(
+    title = "Invasive disease density over age and time",
+    x = "Time (years)",
+    y = "Age (years)",
+    fill = "D"
+  )
+```
+
+```{r carriage-heatmap}
+ggplot(heatmap_df, aes(time, age, fill = carriage)) +
+  geom_raster(interpolate = FALSE) +
+  scale_fill_gradient(low = "#fff5eb", high = "#7f2704") +
+  labs(
+    title = "Carriage density over age and time",
+    x = "Time (years)",
+    y = "Age (years)",
+    fill = "C"
+  )
+```
+
+
+```{r prevalence-heatmap}
+prevalence_long <- heatmap_df |>
+  select(time, age, prevalence_disease, prevalence_carriage) |>
+  pivot_longer(c(prevalence_disease, prevalence_carriage), names_to = "quantity", values_to = "value")
+
+ggplot(prevalence_long, aes(time, age, fill = value)) +
+  geom_raster(interpolate = FALSE) +
+  scale_fill_gradient(low = "#fff5eb", high = "#7f2704") +
+  facet_wrap(~ quantity) +
+  labs(
+    title = "Age-specific prevalence over age and time",
+    x = "Time (years)",
+    y = "Age (years)",
+    fill = "Prev."
+  )
+```
