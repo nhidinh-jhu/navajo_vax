@@ -76,6 +76,7 @@ infectiousness <- rep(1, length(age)) # constant for now, account for age and im
 
 mortality <- 0.008 + 0.06 / (1 + exp(-(age - 72) / 5))
 # Logistic (sigmoid curve) with background mortality of 0.008, steep increase starting around age 72, and width of about 5 years. This is just an illustrative shape for now. We could also do a more realistic U-shaped curve with high mortality in infancy and old age, but this is simpler for now.
+
 fertility_raw <- exp(-0.5 * ((age - 22) / 6)^2)
 # Pure Gaussian shape with peak fertility of 1 at age 22 and width of about 6 years (common fertility curve adjusted to 1988 Navajo data)
 
@@ -117,11 +118,10 @@ immunity_classes <- c("none", "low", "high")
 n_immunity <- length(immunity_classes)
 
 # Susceptibility Multiplier by immunity class (kernel); how vulnerable someone in each class is to getting infected relative to a fully susceptible person
-# Currently have inputed illustrative numbers (40%, 4%) but can change later
 s_immunity <- c(none = 1.0, low = 1.0, high = 0.04)
 alpha_L <- 1 - s_immunity["low"] # efficacy of low antibody against carriage acquisition
 alpha_H <- 1 - s_immunity["high"] # efficacy of high antibody against carriage acquisition
-#LOW s_immunity adjusted from 0.4 to 1.0 per Jackson et al. (low antibody does not protect against carriage, only high antibody) and HIGH s_immunity slightly adjusted from 0.05 to 0.04 per Jackson et al.
+#LOW s_immunity set to be 1.0 per Jackson et al. (low antibody does not protect against carriage, only high antibody) and HIGH s_immunity set to 0.04 per Jackson et al.
 
 # NEW: efficacy of antibody against progression from carriage to invasive disease.
 # These are conceptually distinct from alpha_L/alpha_H (protection against acquiring
@@ -143,9 +143,9 @@ wane_high_to_low <- dplyr::case_when(
 wane_low_to_none <- 0.0939
 
 rho_C <- 2.1759 # rate of recovery from carriage (1/duration of carriage episode)
-# updated from 6 based on duration of carriage reported by Jackson et al.
+# Based on duration of carriage reported by Jackson et al.
 rho_I <- 33.2067 # rate of recovery from invasive disease (1/duration of illness)
-# updated from 4 based on duration of carriage reported by Jackson et al.
+# Based on duration of carriage reported by Jackson et al. 
 
 # External Force of Infection
 lambda_ext <- 0.0005
@@ -248,13 +248,39 @@ ggplot(initial_counts_df, aes(age, count, colour = compartment)) +
 The force of infection is now driven by **total carriers**, and the population total in the denominator now includes `C` and `D` as well as `S`.
 
 ```{r forcing-functions-and-reaction-step}
-force_of_infection <- function(S, C, D, beta, susceptibility, infectiousness, da, lambda_ext = 0.0005) {
+force_of_infection <- function(S, C, D, beta_matrix, susceptibility, infectiousness, age_group_idx, da, lambda_ext = 0.0005) {
   total_S <- rowSums(S)
   total_C <- rowSums(C)
-  total_pop <- sum((total_S + total_C + D) * da)
-  infectious_pressure <- sum(infectiousness * total_C * da) / max(total_pop, 1e-12)
+  total_pop_by_age <- total_S + total_C + D
   
-  (beta * susceptibility * infectious_pressure) + lambda_ext
+  # Calculate infectious density and total population mass per fine bin
+  inf_bin <- infectiousness * total_C * da
+  pop_bin <- total_pop_by_age * da
+  
+  # Initialize group vectors for all 4 groups (ensures fixed length 4 even if a group is empty)
+  C_group <- numeric(4)
+  N_group <- numeric(4)
+  
+  # Aggregate mass into the 4 contact age groups
+  c_agg <- tapply(inf_bin, age_group_idx, sum)
+  n_agg <- tapply(pop_bin, age_group_idx, sum)
+  
+  C_group[as.numeric(names(c_agg))] <- c_agg
+  N_group[as.numeric(names(n_agg))] <- n_agg
+  
+  # Calculate carrier proportion safely (avoid 0/0 -> NaN)
+  prop_inf_group <- ifelse(N_group > 0, C_group / N_group, 0)
+  
+  # Matrix multiplication to get group-level FOI (returns a 4x1 vector)
+  lambda_group <- as.vector(beta_matrix %*% prop_inf_group)
+  
+  # Map back to 160 fine age bins and apply susceptibility modifier
+  lambda_age <- lambda_group[age_group_idx] * susceptibility
+  
+  # Ensure no residual NAs and add external FOI
+  lambda_age <- ifelse(is.na(lambda_age), 0, lambda_age) + lambda_ext
+  
+  return(lambda_age)
 }
 
 birth_influx <- function(S, C, D, fertility, da) {
@@ -356,7 +382,7 @@ reaction_step_desolve <- function(
 
 ```{r simulator}
 simulate_mcvf_sir_imex <- function(
-  S0, C0, D0, age, time, da, dt, grid, beta, sigma,
+  S0, C0, D0, age, time, da, dt, grid, beta_matrix, age_group_idx, sigma,
   susceptibility, infectiousness, fertility, mortality, 
   n_immunity, immunity_classes, alpha_L, alpha_H, beta_L, beta_H, 
   wane_high_to_low, wane_low_to_none, rho_C, rho_I,
@@ -376,7 +402,17 @@ simulate_mcvf_sir_imex <- function(
   for (n in seq_along(time)) {
     t_now <- time[n]
 
-    lambda_now <- force_of_infection(S, C, D, beta, susceptibility, infectiousness, da, lambda_ext)
+    # UPDATED FOI CALL
+    lambda_now <- force_of_infection(
+      S = S, C = C, D = D, 
+      beta_matrix = beta_matrix, 
+      susceptibility = susceptibility, 
+      infectiousness = infectiousness, 
+      age_group_idx = age_group_idx, 
+      da = da, 
+      lambda_ext = lambda_ext
+    )
+    
     births_now <- birth_influx(S, C, D, fertility, da)
 
     total_S_by_class <- colSums(S * da)
@@ -404,13 +440,11 @@ simulate_mcvf_sir_imex <- function(
     if (any(abs(t_now - snapshot_times) < dt / 2)) {
       snapshot_store[[snap_counter]] <- tibble(
         time = t_now, age = age,
-        # Absolute counts per bin (Density * da)
         S_none_count = S[, "none"] * da, S_low_count = S[, "low"] * da, S_high_count = S[, "high"] * da,
         C_none_count = C[, "none"] * da, C_low_count = C[, "low"] * da, C_high_count = C[, "high"] * da,
         D_count      = D * da,
         total_carriage_count = rowSums(C) * da,
         total_disease_count  = D * da,
-        # Annualized incident cases per bin
         new_disease_cases_per_year = (sigma * rowSums(C)) * da
       )
       snap_counter <- snap_counter + 1
@@ -428,7 +462,6 @@ simulate_mcvf_sir_imex <- function(
 
     if (n == length(time)) break
     
-    # Boundary values at Age 0
     S_boundary <- c(none = births_now * frac_maternal_none,
                     low  = births_now * frac_maternal_low,
                     high = births_now * frac_maternal_high)[immunity_classes]
@@ -459,7 +492,6 @@ simulate_mcvf_sir_imex <- function(
     heatmap   = bind_rows(heatmap_store)
   )
 }
-
 ```
 
 # Run the Simulation
@@ -467,7 +499,8 @@ simulate_mcvf_sir_imex <- function(
 ```{r run-simulation}
 out <- simulate_mcvf_sir_imex(
   S0 = S0, C0 = C0, D0 = D0, age = age, time = time, da = da, dt = dt, grid = grid,
-  beta = beta, sigma = sigma, susceptibility = susceptibility, infectiousness = infectiousness,
+  beta_matrix = beta_matrix, age_group_idx = age_group_idx, sigma = sigma, 
+  susceptibility = susceptibility, infectiousness = infectiousness,
   fertility = fertility, mortality = mortality, n_immunity = n_immunity,
   immunity_classes = immunity_classes, alpha_L = alpha_L, alpha_H = alpha_H,
   beta_L = beta_L, beta_H = beta_H, wane_high_to_low = wane_high_to_low,
@@ -476,7 +509,6 @@ out <- simulate_mcvf_sir_imex(
   frac_maternal_high = frac_maternal_high, snapshot_times = c(0, 1, 2, 4, 8, 12),
   heatmap_stride = 2
 )
-
 summary_df   <- out$summary
 snapshots_df <- out$snapshots
 heatmap_df   <- out$heatmap
@@ -621,8 +653,15 @@ ggplot(summary_aux, aes(time, value)) +
 
 ```{r age-profiles}
 snapshot_long <- snapshots_df |>
-  pivot_longer(cols = c(S_none, S_low, S_high, C_none, C_low, C_high, D), names_to = "compartment", values_to = "density") |>
-  mutate(time_label = paste0("t = ", format(round(time, 1), nsmall = 1)))
+  pivot_longer(
+    cols = c(S_none_count, S_low_count, S_high_count,
+             C_none_count, C_low_count, C_high_count, D_count),
+    names_to = "compartment", values_to = "density"
+  ) |>
+  mutate(
+    compartment = gsub("_count", "", compartment),
+    time_label  = paste0("t = ", format(round(time, 1), nsmall = 1))
+  )
 
 ggplot(snapshot_long, aes(age, density, colour = compartment)) +
   geom_line(linewidth = 0.9) +
@@ -645,7 +684,7 @@ ggplot(snapshot_long, aes(age, density, colour = compartment)) +
 These heatmaps are often the easiest way to see what an age-structured McVF model is doing.
 
 ```{r disease-heatmap}
-ggplot(heatmap_df, aes(time, age, fill = D)) +
+ggplot(heatmap_df, aes(time, age, fill = D_cases)) +
   geom_raster(interpolate = FALSE) +
   scale_fill_gradient(low = "#f7fbff", high = "#08306b") +
   labs(
@@ -657,7 +696,7 @@ ggplot(heatmap_df, aes(time, age, fill = D)) +
 ```
 
 ```{r carriage-heatmap}
-ggplot(heatmap_df, aes(time, age, fill = carriage)) +
+ggplot(heatmap_df, aes(time, age, fill = carriage_cases)) +
   geom_raster(interpolate = FALSE) +
   scale_fill_gradient(low = "#fff5eb", high = "#7f2704") +
   labs(
