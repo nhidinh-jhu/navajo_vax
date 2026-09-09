@@ -20,8 +20,6 @@ knitr::opts_chunk$set(
   fig.retina = 2
 )
 
-.libPaths(c("C:/Users/nhdinh/jh", .libPaths()))
-
 library(deSolve)
 library(ReacTran)
 library(ggplot2)
@@ -34,7 +32,7 @@ theme_set(theme_minimal(base_size = 13))
 
 ```{r grids-and-parameters}
 age_max <- 80 # Setting oldest age in population to 80 years [MAY WANT TO CHANGE THIS?]
-da <- 0.5 # Width of one age bin in years
+da <- 0.25 # Width of one age bin in years
 dt <- 0.1 # Size of one time step in years
 time_max <- 12 # Simulation horizon in years
 
@@ -57,14 +55,25 @@ N0_shape <- N0_shape / sum(N0_shape * da)  # Normalized baseline density (integr
 # Population density scaled to N_target persons
 N0_density <- N0_shape * N_target
 
+beta_matrix <- matrix(c( # Reference Jackson et al. 2012, Appendix 2 Table 2, contact matrix for Alaska Native population)
+  # Row: Age of susceptible population | # Column: Age of infectious population
+  # [0,1] [2,4] [5,9] [>=10]
+    2.11, 0.15, 0.53, 0.03,  #[0,1]
+    0.55, 0.40, 0.50, 0.12,  #[2,4]
+    0.56, 3.68, 3.61, 0.13,  #[5,9]
+    0.55, 0.55, 0.81, 1.43   #[>=10]
+), nrow=4, byrow=TRUE) # beta_ij
+age_group_idx <- dplyr::case_when(
+  age < 2.0 ~ 1,
+  age >= 2.0 & age < 5.0 ~ 2,
+  age >= 5.0 & age < 10.0 ~ 3,
+  TRUE ~ 4
+)
 
-beta <- 40 # Transmission coefficient/scale - illustrative value for now [MAY NEED TO UPDATE]
-#represents overall contact volume and per-contact Hib transmission probability
+susceptibility <- rep(1, length(age)) # constant for now, account for age and immunity level later / need to check with Shaun/Josh
+infectiousness <- rep(1, length(age)) # constant for now, account for age and immunity level later / need to check with Shaun/Josh
 
-susceptibility <- 0.65 + 0.75 * exp(-((age - 4) / 6)^2) 
-# Gaussian shape - This example sets everyone to has baseline susceptibility of 0.65, with a childhood bump (susceptibility at 0.75) peaking at age 4, width ~6 years 
-infectiousness <- 0.55 + 0.95 * exp(-((age - 8) / 7)^2)
-# Gaussian shape - This example sets everyone to has baseline infectiousness of 0.55, with a peak at 0.95 (high transmission in school-age children), peaking at age 8, width ~7 years
+
 mortality <- 0.008 + 0.06 / (1 + exp(-(age - 72) / 5))
 # Logistic (sigmoid curve) with background mortality of 0.008, steep increase starting around age 72, and width of about 5 years. This is just an illustrative shape for now. We could also do a more realistic U-shaped curve with high mortality in infancy and old age, but this is simpler for now.
 fertility_raw <- exp(-0.5 * ((age - 22) / 6)^2)
@@ -80,24 +89,28 @@ fertility <- fertility_scale * fertility_raw
 ## Aligned with 4-month maternal antibody clearance & 4-12 month peak vulnerability and reflecting the epidemiology of invasive Hib disease being concentrated in young children.
 
 # Parameters
-sigma_peak     <- 0.025   # Peak progression rate per year (~2.5% progression risk/yr if non-immune)
-sigma_baseline <- 0.0001  # Minimal baseline progression risk for older age groups
-a_peak         <- 0.50    # Peak age (~6 months, onset starts after ~4 mo loss of maternal IgG)
-width_s        <- 0.55    # Shape parameter controlling age-width of susceptibility window
 
-# Calculate log-normal shape centered around 6 months (0.5 years)
-# Add small offset (1e-4) to prevent log(0) at age = 0
-sigma <- sigma_baseline + sigma_peak * exp(-((log(age + 1e-4) - log(a_peak))^2) / (2 * width_s^2))
+# Updated age-dependent sigma from Jackson et al. (for Alaska Native population)
+# Jackson et al baseline and amplitude are weekly rates, convert to annual rates (* 52.1775):
+sigma_base_annual <- 3.50e-5 * 52.1775   # ~0.001826 / year
+sigma_amp_annual  <- 0.01591 * 52.1775   # ~0.83014  / year
+decay_rate_weekly <- 0.0371              # Per week decay rate
 
+age_in_weeks <- age * 52.1775
 
 # Maternal antibody fractions; proportion of newborns that enter in each immunity status. Currently illustrative. Also need to fix so that rate at which maternal antibodies wane is faster than normal antibody waning effect. 
+#frac_maternal_high <- 0.79
+#frac_maternal_low <- 0.00
+#frac_maternal_none <- 1 - frac_maternal_high - frac_maternal_low
 
-frac_maternal_high <- 0.79
-frac_maternal_low <- 0.00
-frac_maternal_none <- 1 - frac_maternal_high - frac_maternal_low
+# Empirical maternal antibody clearance rate (half-life ~ 6-8 weeks)
+mu_mat <- 0.065 # per week
 
-kable(param_table, digits = 3)
+# Maternal susceptibility multiplier: 0 at birth, approaching 1 as antibodies decay
+maternal_decay <- 1 - exp(-mu_mat * age_in_weeks)
 
+# Jackson et al. sigma scaled by maternal antibody loss
+sigma <- (sigma_base_annual + sigma_amp_annual * exp(-decay_rate_weekly * age_in_weeks)) * maternal_decay
 
 # DEFINING IMMUNITY CLASSES AND KERNEL
 immunity_classes <- c("none", "low", "high")
@@ -118,11 +131,6 @@ beta_L <- 0.90  # efficacy of low antibody in preventing invasive disease among 
 beta_H <- 0.98  # efficacy of high antibody in preventing invasive disease among carriers
 #updated to 0.90 and 0.98 for low and high antibody, respectively, protection against invasive disease
 
-#OLD WANING RATE CODE, not age dependent
-#waning_rate <- c(none = 0, low = 0.5, high = 0.1)
-#wane_high_to_low <- waning_rate["high"]
-#wane_low_to_none <- waning_rate["low"]
-
 #NEW WANING RATE CODE, per Jackson et al.
 # High to Low antibody waning depends on host age:
 # <1 year: 4.9987/yr | 1-2 years: 0.3287/yr | >=2 years: 0.1983/yr
@@ -139,28 +147,16 @@ rho_C <- 2.1759 # rate of recovery from carriage (1/duration of carriage episode
 rho_I <- 33.2067 # rate of recovery from invasive disease (1/duration of illness)
 # updated from 4 based on duration of carriage reported by Jackson et al.
 
-
 # External Force of Infection
 lambda_ext <- 0.0005
 
 # Vaccine Efficacy Baseline (for subsequent policy/vaccination adjustments/simulations)
 vaccine_efficacy <- ifelse(age < 1.0, 0.99, 1.00)
-
-param_table <- tibble(
-  Parameter = c("Population Target N", "Age Bin Width da", "Time Step dt", "Simulation Horizon", 
-                "CFL Number", "Carriage Recovery (rho_C)", "Disease Recovery (rho_I)", 
-                "External FOI (lambda_ext)"),
-  Value = c(N_target, da, dt, time_max, cfl, rho_C, rho_I, lambda_ext)
-)
-kable(param_table, digits = 4)
-
 ```
 
 ```{r ingredient-plots}
 ingredient_df <- tibble(
   age = age,
-  susceptibility = susceptibility,
-  infectiousness = infectiousness,
   mortality = mortality,
   fertility = fertility,
   sigma = sigma
@@ -689,3 +685,4 @@ ggplot(prevalence_long, aes(time, age, fill = value)) +
     fill = "Prev."
   )
 ```
+
