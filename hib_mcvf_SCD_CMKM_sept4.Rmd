@@ -34,7 +34,7 @@ theme_set(theme_minimal(base_size = 13))
 age_max <- 80 # Setting oldest age in population to 80 years [MAY WANT TO CHANGE THIS?]
 da <- 0.25 # Width of one age bin in years
 dt <- 0.1 # Size of one time step in years
-time_max <- 12 # Simulation horizon in years
+time_max <- 20 # Simulation horizon in years
 
 grid <- setup.grid.1D(x.up = 0, L = age_max, N = round(age_max / da))
 age <- grid$x.mid # Age values at bin centers
@@ -588,10 +588,57 @@ snapshots_df |>
   geom_line(linewidth = 1.1) +
   labs(
     title = "Annualized New Invasive Hib Cases by Age (<5 Years)",
-    subtitle = "Peak vulnerability driven by maternal IgG decay at 4 months",
     x = "Age (years)", y = "New Cases / Year (per Bin)", colour = "Time Step"
   )
 
+```
+
+library(dplyr)
+library(ggplot2)
+
+```{r per-100k-incidence}
+# 1. Transform summary_df to add per 100k rates
+summary_rates_df <- summary_df %>%
+   mutate(total_pop = S_none + S_low + S_high + C_none + C_low + C_high + D) %>%
+  mutate(
+    birth_rate_per_100k    = (births / total_pop) * 100000,
+    carriage_rate_per_100k = (carriage_incidence / total_pop) * 100000,
+    disease_rate_per_100k  = (disease_incidence / total_pop) * 100000
+  )
+
+# 2. Reshape to long format for clean multi-panel ggplotting
+library(tidyr)
+
+plot_df <- summary_rates_df %>%
+  select(time, birth_rate_per_100k, carriage_rate_per_100k, disease_rate_per_100k) %>%
+  pivot_longer(
+    cols = -time,
+    names_to = "metric",
+    values_to = "rate_per_100k"
+  ) %>%
+  mutate(
+    metric = factor(
+      metric,
+      levels = c("birth_rate_per_100k", "carriage_rate_per_100k", "disease_rate_per_100k"),
+      labels = c("Birth Rate (per 100k)", "Carriage Incidence (per 100k)", "Disease Incidence (per 100k)")
+    )
+  )
+
+ggplot(plot_df, aes(x = time, y = rate_per_100k)) +
+  geom_line(color = "#1f77b4", linewidth = 1) +
+  facet_wrap(~ metric, ncol = 1, scales = "free_y") +
+  scale_x_continuous(breaks = seq(0, 12, by = 2.5)) +
+  labs(
+    title = "Annualized Incidence Rates per 100,000 Population",
+    x = "Time (years)",
+    y = "Rate per 100,000 Person-Years"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    strip.text = element_text(size = 11),
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(hjust = 0.5)
+  )
 ```
 
 #cases heatmap (absolute)
@@ -679,49 +726,321 @@ ggplot(snapshot_long, aes(age, density, colour = compartment)) +
   theme(legend.position = "none")
 ```
 
-# Heatmaps
 
-These heatmaps are often the easiest way to see what an age-structured McVF model is doing.
+```{r burn-in-plus-vaccination}
+# ==============================================================================
+# 1. CORE REACTION & SOLVER FUNCTIONS (FIXED DERIVATIVE PACKING & VACCINATION)
+# ==============================================================================
 
-```{r disease-heatmap}
-ggplot(heatmap_df, aes(time, age, fill = D_cases)) +
-  geom_raster(interpolate = FALSE) +
-  scale_fill_gradient(low = "#f7fbff", high = "#08306b") +
-  labs(
-    title = "Invasive disease density over age and time",
-    x = "Time (years)",
-    y = "Age (years)",
-    fill = "D"
+# Reaction RHS function for deSolve
+reaction_rhs <- function(t, y, parms) {
+  with(parms, {
+    state <- unpack_state(y, n_age, n_immunity, immunity_classes)
+    
+    S_none <- state$S[, "none"]
+    S_low  <- state$S[, "low"]
+    S_high <- state$S[, "high"]
+    
+    C_none <- state$C[, "none"]
+    C_low  <- state$C[, "low"]
+    C_high <- state$C[, "high"]
+    
+    D      <- state$D
+    
+    lambda_none <- lambda 
+    lambda_low  <- lambda * (1 - alpha_L)
+    lambda_high <- lambda * (1 - alpha_H)
+    
+    sigma_none <- sigma
+    sigma_low  <- sigma * (1 - beta_L)
+    sigma_high <- sigma * (1 - beta_H)
+    
+    # Optional continuous vaccination rate vector (defaults to zero)
+    v_rate <- if ("vaccination_rate" %in% names(parms) && !is.null(vaccination_rate)) vaccination_rate else numeric(n_age)
+    
+    # Differential equations
+    # Vaccination shifts uninfected S_none and S_low directly into S_high
+    dS_none <- -(lambda_none + mortality + v_rate) * S_none + wane_low_to_none * S_low
+    dS_low  <- -(lambda_low + wane_low_to_none + mortality + v_rate) * S_low + wane_high_to_low * S_high 
+    dS_high <- -(lambda_high + wane_high_to_low + mortality) * S_high + (C_none + C_low + C_high) * rho_C + rho_I * D + v_rate * (S_none + S_low)
+    
+    dC_none <- lambda_none * S_none - (sigma_none + rho_C + mortality) * C_none
+    dC_low  <- lambda_low * S_low - (sigma_low + rho_C + mortality) * C_low
+    dC_high <- lambda_high * S_high - (sigma_high + rho_C + mortality) * C_high
+    
+    disease_inflow <- sigma_none * C_none + sigma_low * C_low + sigma_high * C_high
+    dD             <- disease_inflow - (rho_I + mortality) * D
+    
+    dS <- cbind(none = dS_none, low = dS_low, high = dS_high)
+    dC <- cbind(none = dC_none, low = dC_low, high = dC_high)
+    
+    # Return vector matching exact length and structure of y (3*n_age + 3*n_age + n_age = 7*n_age)
+    dy <- c(as.vector(dS), as.vector(dC), as.vector(dD))
+    
+    list(dy)
+  })
+}
+
+# Reaction step solver wrapper
+reaction_step_desolve <- function(
+  S_star, C_star, D_star, lambda, sigma, mortality, dt, n_age, n_immunity, 
+  immunity_classes, alpha_L, alpha_H, beta_L, beta_H, 
+  wane_high_to_low, wane_low_to_none, rho_C, rho_I, vaccination_rate = NULL
+) {
+  y_star <- pack_state(S_star, C_star, D_star)
+
+  sol <- ode(
+    y = y_star, times = c(0, dt), func = reaction_rhs,
+    parms = list(
+      lambda = lambda, sigma = sigma, mortality = mortality,
+      n_age = n_age, n_immunity = n_immunity, immunity_classes = immunity_classes,
+      alpha_L = alpha_L, alpha_H = alpha_H, beta_L = beta_L, beta_H = beta_H,
+      wane_high_to_low = wane_high_to_low, wane_low_to_none = wane_low_to_none,
+      rho_C = rho_C, rho_I = rho_I, vaccination_rate = vaccination_rate
+    ),
+    method = "radau", rtol = 1e-6, atol = 1e-8
   )
+
+  unpack_state(sol[2, -1], n_age, n_immunity, immunity_classes)
+}
+
+# Main simulation loop function
+simulate_mcvf_sir_imex <- function(
+  S0, C0, D0, age, time, da, dt, grid, beta_matrix, age_group_idx, sigma,
+  susceptibility, infectiousness, fertility, mortality, 
+  n_immunity, immunity_classes, alpha_L, alpha_H, beta_L, beta_H, 
+  wane_high_to_low, wane_low_to_none, rho_C, rho_I,
+  frac_maternal_none, frac_maternal_low, frac_maternal_high,
+  vaccination_rate = NULL, snapshot_times = c(0, 1, 2, 4, 8, 12), heatmap_stride = 2
+) {
+  S <- S0
+  C <- C0
+  D <- D0
+  
+  n_age <- length(age)
+  summary_store  <- vector("list", length(time))
+  snapshot_store <- list()
+  heatmap_store  <- list()
+  snap_counter   <- 1
+
+  for (n in seq_along(time)) {
+    t_now <- time[n]
+
+    lambda_now <- force_of_infection(
+      S = S, C = C, D = D, 
+      beta_matrix = beta_matrix, 
+      susceptibility = susceptibility, 
+      infectiousness = infectiousness, 
+      age_group_idx = age_group_idx, 
+      da = da, 
+      lambda_ext = lambda_ext
+    )
+    
+    births_now <- birth_influx(S, C, D, fertility, da)
+
+    total_S_by_class <- colSums(S * da)
+    total_S          <- sum(total_S_by_class)
+    
+    total_C_by_class <- colSums(C * da)
+    total_C          <- sum(total_C_by_class)
+    
+    total_D <- sum(D * da)
+    total_N <- total_S + total_C + total_D
+    
+    carriage_incidence_now <- sum(lambda_now * rowSums(S) * da)
+    disease_incidence_now  <- sum(sigma * rowSums(C) * da)
+
+    summary_store[[n]] <- tibble(
+      time = t_now, S = total_S,
+      S_none = total_S_by_class["none"], S_low = total_S_by_class["low"], S_high = total_S_by_class["high"],
+      C = total_C,
+      C_none = total_C_by_class["none"], C_low = total_C_by_class["low"], C_high = total_C_by_class["high"],
+      D = total_D, N = total_N, births = births_now,
+      carriage_incidence = carriage_incidence_now, disease_incidence = disease_incidence_now,
+      mean_lambda = mean(lambda_now)
+    )
+
+    if (any(abs(t_now - snapshot_times) < dt / 2)) {
+      snapshot_store[[snap_counter]] <- tibble(
+        time = t_now, age = age,
+        S_none_count = S[, "none"] * da, S_low_count = S[, "low"] * da, S_high_count = S[, "high"] * da,
+        C_none_count = C[, "none"] * da, C_low_count = C[, "low"] * da, C_high_count = C[, "high"] * da,
+        D_count      = D * da,
+        total_carriage_count = rowSums(C) * da,
+        total_disease_count  = D * da,
+        new_disease_cases_per_year = (sigma * rowSums(C)) * da
+      )
+      snap_counter <- snap_counter + 1
+    }
+
+    if ((n - 1) %% heatmap_stride == 0) {
+      heatmap_store[[length(heatmap_store) + 1]] <- tibble(
+        time = t_now, age = age,
+        D_cases = D * da,
+        carriage_cases = rowSums(C) * da,
+        prevalence_disease = D / pmax(rowSums(S) + rowSums(C) + D, 1e-12),
+        prevalence_carriage = rowSums(C) / pmax(rowSums(S) + rowSums(C) + D, 1e-12)
+      )
+    }
+
+    if (n == length(time)) break
+    
+    S_boundary <- c(none = births_now * frac_maternal_none,
+                    low  = births_now * frac_maternal_low,
+                    high = births_now * frac_maternal_high)[immunity_classes]
+    C_boundary <- c(none = 0, low = 0, high = 0)[immunity_classes]
+    D_boundary <- 0
+
+    S_star <- age_transport_step_matrix(S, S_boundary, dt, grid)
+    C_star <- age_transport_step_matrix(C, C_boundary, dt, grid)
+    D_star <- age_transport_step(D, D_boundary, dt, grid)
+
+    react <- reaction_step_desolve(
+      S_star = S_star, C_star = C_star, D_star = D_star,
+      lambda = lambda_now, sigma = sigma, mortality = mortality, dt = dt,
+      n_age = n_age, n_immunity = n_immunity, immunity_classes = immunity_classes,
+      alpha_L = alpha_L, alpha_H = alpha_H, beta_L = beta_L, beta_H = beta_H,
+      wane_high_to_low = wane_high_to_low, wane_low_to_none = wane_low_to_none,
+      rho_C = rho_C, rho_I = rho_I, vaccination_rate = vaccination_rate
+    )
+
+    S <- pmax(react$S, 0)
+    C <- pmax(react$C, 0)
+    D <- pmax(react$D, 0)
+  }
+
+  list(
+    summary     = bind_rows(summary_store),
+    snapshots   = bind_rows(snapshot_store),
+    heatmap     = bind_rows(heatmap_store),
+    final_state = list(S = S, C = C, D = D) # Exposes final matrices for stage transitions
+  )
+}
+
+# ==============================================================================
+# 2. RUN 20-YEAR BURN-IN SIMULATION (NO VACCINATION)
+# ==============================================================================
+message("Running 20-year burn-in to reach endemic equilibrium...")
+
+burnin_horizon <- 20
+time_burnin    <- seq(0, burnin_horizon, by = dt)
+
+out_burnin <- simulate_mcvf_sir_imex(
+  S0 = S0, C0 = C0, D0 = D0, age = age, time = time_burnin, da = da, dt = dt, grid = grid,
+  beta_matrix = beta_matrix, age_group_idx = age_group_idx, sigma = sigma, 
+  susceptibility = susceptibility, infectiousness = infectiousness,
+  fertility = fertility, mortality = mortality, n_immunity = n_immunity,
+  immunity_classes = immunity_classes, alpha_L = alpha_L, alpha_H = alpha_H,
+  beta_L = beta_L, beta_H = beta_H, wane_high_to_low = wane_high_to_low,
+  wane_low_to_none = wane_low_to_none, rho_C = rho_C, rho_I = rho_I,
+  frac_maternal_none = frac_maternal_none, frac_maternal_low = frac_maternal_low,
+  frac_maternal_high = frac_maternal_high, snapshot_times = c(0, 5, 10, 15, 20),
+  heatmap_stride = 2
+)
+
+# Extract endemic equilibrium matrices
+S0_equilibrium <- out_burnin$final_state$S
+C0_equilibrium <- out_burnin$final_state$C
+D0_equilibrium <- out_burnin$final_state$D
+
+message("Burn-in complete. Initializing routine vaccination scenario...")
+
+# ==============================================================================
+# 3. DEFINE VACCINATION PARAMETERS & RUN VACCINATION SCENARIO (10 YEARS)
+# ==============================================================================
+# Target age range: 7 to 15 months (0.5833 to 1.25 years)
+vac_age_min <- 7 / 12   
+vac_age_max <- 15 / 12  
+
+vac_indices <- which(age >= vac_age_min & age <= vac_age_max)
+vac_coverage <- 0.875   # Midpoint coverage (87.5%)
+
+delta_v_age   <- vac_age_max - vac_age_min
+v_rate_annual <- -log(1 - vac_coverage) / delta_v_age
+
+vaccination_rate <- numeric(length(age))
+vaccination_rate[vac_indices] <- v_rate_annual
+
+time_vax <- seq(0, 10, by = dt)
+
+out_vax <- simulate_mcvf_sir_imex(
+  S0 = S0_equilibrium, C0 = C0_equilibrium, D0 = D0_equilibrium, 
+  age = age, time = time_vax, da = da, dt = dt, grid = grid,
+  beta_matrix = beta_matrix, age_group_idx = age_group_idx, sigma = sigma, 
+  susceptibility = susceptibility, infectiousness = infectiousness,
+  fertility = fertility, mortality = mortality, n_immunity = n_immunity,
+  immunity_classes = immunity_classes, alpha_L = alpha_L, alpha_H = alpha_H,
+  beta_L = beta_L, beta_H = beta_H, wane_high_to_low = wane_high_to_low,
+  wane_low_to_none = wane_low_to_none, rho_C = rho_C, rho_I = rho_I,
+  frac_maternal_none = frac_maternal_none, frac_maternal_low = frac_maternal_low,
+  frac_maternal_high = frac_maternal_high,
+  vaccination_rate = vaccination_rate,
+  snapshot_times = c(0, 1, 2, 5, 10),
+  heatmap_stride = 2
+)
 ```
 
-```{r carriage-heatmap}
-ggplot(heatmap_df, aes(time, age, fill = carriage_cases)) +
-  geom_raster(interpolate = FALSE) +
-  scale_fill_gradient(low = "#fff5eb", high = "#7f2704") +
-  labs(
-    title = "Carriage density over age and time",
-    x = "Time (years)",
-    y = "Age (years)",
-    fill = "C"
+```{r postvax-plots-one}
+# ==============================================================================
+# 4. PLOT INCIDENCE IMPACT POST-VACCINATION
+# ==============================================================================
+summary_vax_df <- out_vax$summary %>%
+  mutate(
+    total_pop = S_none + S_low + S_high + C_none + C_low + C_high + D,
+    disease_rate_per_100k  = (disease_incidence / total_pop) * 100000,
+    carriage_rate_per_100k = (carriage_incidence / total_pop) * 100000
   )
+
+ggplot(summary_vax_df, aes(x = time)) +
+  geom_line(aes(y = disease_rate_per_100k, color = "Invasive Disease"), linewidth = 1.2) +
+  geom_line(aes(y = carriage_rate_per_100k / 100, color = "Carriage (x1/100)"), linewidth = 1, linetype = "dashed") +
+  labs(
+    title = "Impact of Routine Pediatric Vaccination",
+    subtitle = "Simulation initialized from 20-year burn-in endemic equilibrium",
+    x = "Years Since Vaccination Implementation",
+    y = "Incidence Rate per 100,000",
+    color = "Metric"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom", plot.title = element_text(face = "bold"))
+
 ```
 
-
-```{r prevalence-heatmap}
-prevalence_long <- heatmap_df |>
-  select(time, age, prevalence_disease, prevalence_carriage) |>
-  pivot_longer(c(prevalence_disease, prevalence_carriage), names_to = "quantity", values_to = "value")
-
-ggplot(prevalence_long, aes(time, age, fill = value)) +
-  geom_raster(interpolate = FALSE) +
-  scale_fill_gradient(low = "#fff5eb", high = "#7f2704") +
-  facet_wrap(~ quantity) +
+```{r postvax-plots-two}
+ggplot(summary_vax_df, aes(x = time, y = disease_rate_per_100k)) +
+  geom_line(color = "#D55E00", linewidth = 1.2) +
   labs(
-    title = "Age-specific prevalence over age and time",
-    x = "Time (years)",
-    y = "Age (years)",
-    fill = "Prev."
-  )
+    title = "Impact of Routine Pediatric Vaccination on Severe Invasive Disease",
+    subtitle = "Overall population incidence following 20-year burn-in equilibrium",
+    x = "Years Since Vaccination Implementation",
+    y = "Severe Disease Incidence Rate per 100,000"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"))
+
 ```
 
+```{r postvax-plots-three}
+# Calculate incidence per 100,000 specifically for age < 5
+under5_vax_df <- out_vax$snapshots %>%
+  filter(age < 5) %>%
+  group_by(time) %>%
+  summarize(
+    new_cases_under5 = sum(new_disease_cases_per_year),
+    pop_under5       = sum(S_none_count + S_low_count + S_high_count + 
+                           C_none_count + C_low_count + C_high_count + D_count),
+    disease_rate_under5_per_100k = (new_cases_under5 / pop_under5) * 100000,
+    .groups = "drop"
+  )
+
+ggplot(under5_vax_df, aes(x = time, y = disease_rate_under5_per_100k)) +
+  geom_line(color = "#1170AA", linewidth = 1.2) +
+  labs(
+    title = "Impact of Routine Pediatric Vaccination on Severe Disease (<5 Years)",
+    subtitle = "Incidence among children under 5 following 20-year burn-in equilibrium",
+    x = "Years Since Vaccination Implementation",
+    y = "Severe Disease Incidence Rate per 100,000 (<5 yrs)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"))
+```
