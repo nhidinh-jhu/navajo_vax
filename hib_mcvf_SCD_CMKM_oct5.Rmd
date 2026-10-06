@@ -1,0 +1,1218 @@
+---
+title: "A McKendrick-von Foerster Age-Structured SIRS Model With Immunity in R"
+author: ""
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 9,
+  fig.height = 5.5,
+  fig.retina = 2
+)
+
+library(deSolve)
+library(ReacTran)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(knitr)
+
+theme_set(theme_minimal(base_size = 13))
+```
+
+```{r grids-and-parameters}
+age_max <- 80 # Setting oldest age in population to 80 years
+da <- 0.25    # Width of one age bin in years
+dt <- 0.1     # Size of one time step in years
+time_max <- 20 # Baseline simulation horizon in years
+
+grid <- setup.grid.1D(x.up = 0, L = age_max, N = round(age_max / da))
+age <- grid$x.mid # Age values at bin centers
+time <- seq(0, time_max, by = dt)
+
+n_age <- length(age) # Number of age bins
+cfl <- dt / da 
+stopifnot(cfl <= 1) # Sanity check for CFL condition
+
+# Population scale
+N_target <- 200000 
+
+# Age distribution/shape
+N0_shape <- exp(-0.035 * age) 
+N0_shape <- N0_shape / sum(N0_shape * da)
+
+# Population density scaled to N_target persons
+N0_density <- N0_shape * N_target
+
+beta_matrix <- matrix(c(
+    2.11, 0.15, 0.53, 0.03,  #[0,1]
+    0.55, 0.40, 0.50, 0.12,  #[2,4]
+    0.56, 3.68, 3.61, 0.13,  #[5,9]
+    0.55, 0.55, 0.81, 1.43   #[>=10]
+), nrow = 4, byrow = TRUE)
+
+age_group_idx <- dplyr::case_when(
+  age < 2.0 ~ 1,
+  age >= 2.0 & age < 5.0 ~ 2,
+  age >= 5.0 & age < 10.0 ~ 3,
+  TRUE ~ 4
+)
+
+susceptibility <- rep(1, length(age))
+infectiousness <- rep(1, length(age))
+
+# ==============================================================================
+# DEMOGRAPHIC TIME-VARYING MATRICES
+# ==============================================================================
+demo_time <- seq(0, 50, by = 1)
+n_demo_time <- length(demo_time)
+
+mortality_base <- 0.008 + 0.06 / (1 + exp(-(age - 72) / 5))
+fertility_raw_base <- exp(-0.5 * ((age - 22) / 6)^2)
+
+mortality_decline <- 0.99^(demo_time)
+fertility_drop <- seq(1, 0.7, length.out = n_demo_time)
+
+mortality_mat <- matrix(NA, nrow = n_age, ncol = n_demo_time)
+fertility_mat <- matrix(NA, nrow = n_age, ncol = n_demo_time)
+fertility_mat_scaled <- matrix(NA, nrow = n_age, ncol = n_demo_time)
+
+for (t in 1:n_demo_time) {
+  mortality_mat[, t] <- mortality_base * mortality_decline[t]
+  fertility_mat[, t] <- fertility_raw_base * fertility_drop[t]
+  
+  scale_t <- sum(mortality_mat[, t] * N0_shape * da) / sum(fertility_mat[, t] * N0_shape * da)
+  fertility_mat_scaled[, t] <- scale_t * fertility_mat[, t]
+}
+
+total_deaths_base <- sum(mortality_mat[, 1] * N0_density * da)
+raw_births_base <- sum(fertility_mat_scaled[, 1] * N0_density * da)
+
+fertility_mat_scaled[, 1] <- fertility_mat_scaled[, 1] * (total_deaths_base / raw_births_base)
+
+fertility_mat_burnin <- matrix(fertility_mat_scaled[, 1], nrow = n_age, ncol = n_demo_time)
+mortality_mat_burnin <- matrix(mortality_mat[, 1], nrow = n_age, ncol = n_demo_time)
+
+# ==============================================================================
+# DISEASE & IMMUNITY PARAMETERS
+# ==============================================================================
+sigma_base_annual <- 3.50e-5 * 52.1775
+sigma_amp_annual  <- 0.01591 * 52.1775
+decay_rate_weekly <- 0.0371
+
+age_in_weeks <- age * 52.1775
+mu_mat <- 0.065
+maternal_decay <- 1 - exp(-mu_mat * age_in_weeks)
+
+sigma <- (sigma_base_annual + sigma_amp_annual * exp(-decay_rate_weekly * age_in_weeks)) * maternal_decay
+
+immunity_classes <- c("none", "low", "high")
+n_immunity <- length(immunity_classes)
+
+s_immunity <- c(none = 1.0, low = 1.0, high = 0.04)
+alpha_L <- 1 - s_immunity["low"]
+alpha_H <- 1 - s_immunity["high"]
+
+beta_L <- 0.90
+beta_H <- 0.98
+
+wane_high_to_low <- dplyr::case_when(
+  age < 1.0 ~ 4.9987,
+  age < 2.0 ~ 0.3287,
+  TRUE      ~ 0.1983
+)
+wane_low_to_none <- 0.0939
+
+rho_C <- 2.1759
+rho_I <- 33.2067
+
+lambda_ext <- 0.0005
+vaccine_efficacy <- ifelse(age < 1.0, 0.99, 1.00)
+
+# Define vaccination timeline parameters
+time_vax <- seq(0, 30, by = dt)
+n_time_steps <- length(time_vax)
+```
+
+```{r ingredient-plots}
+ingredient_df <- tibble(
+  age = age,
+  mortality = mortality_mat[, 1],
+  fertility = fertility_mat_scaled[, 1],
+  sigma = sigma
+) |>
+  pivot_longer(-age, names_to = "quantity", values_to = "value")
+
+ggplot(ingredient_df, aes(age, value)) +
+  geom_line(linewidth = 1.0, colour = "#1f78b4") +
+  facet_wrap(~ quantity, scales = "free_y", ncol = 2) +
+  labs(
+    title = "Age-Dependent Biological & Demographic Inputs",
+    x = "Age (years)", y = "Value"
+  )
+
+# ==============================================================================
+# REALISTIC HIB DOSE SCHEDULE & TIME-VARYING VACCINATION MATRIX
+# ==============================================================================
+
+idx_dose1   <- which(age >= 1.5 / 12 & age <= 3.0 / 12)
+idx_dose2   <- which(age >= 3.5 / 12 & age <= 5.0 / 12)
+idx_booster <- which(age >= 11.5 / 12 & age <= 15.0 / 12)
+
+coverage_trend <- pmin(0.50 + 0.40 * (time_vax / 3)^0.8, 0.90)
+
+v_rate_none_to_low_matrix <- matrix(0, nrow = n_age, ncol = n_time_steps)
+v_rate_to_high_matrix      <- matrix(0, nrow = n_age, ncol = n_time_steps)
+
+for (k in seq_len(n_time_steps)) {
+  cov_k <- coverage_trend[k]
+  
+  v_rate_none_to_low_matrix[idx_dose1, k] <- -log(1 - cov_k * 0.65) / (da)
+  v_rate_to_high_matrix[idx_dose2, k]     <- -log(1 - cov_k * 0.92) / (da)
+  v_rate_to_high_matrix[idx_booster, k]   <- -log(1 - cov_k * 0.95) / (da * 3)
+}
+```
+
+# Initial Condition
+
+```{r new-initial-condition}
+frac_maternal_high <- 0.79
+frac_maternal_low  <- 0.00
+frac_maternal_none <- 1 - frac_maternal_high - frac_maternal_low
+
+frac_high_by_age <- frac_maternal_high * exp(-age / 0.12)
+frac_low_by_age  <- frac_maternal_low  * exp(-age / 0.12) + 0.10 * exp(-((age - 1.5) / 1.0)^2)
+frac_none_by_age <- pmax(1 - frac_high_by_age - frac_low_by_age, 0)
+
+carriage_prob <- dplyr::case_when(
+  age < 0.5 ~ 0.007,
+  age >= 0.5 & age < 5.0 ~ 0.015 + 0.020 * (age / 5),
+  age >= 5.0 & age < 10.0 ~ 0.034,
+  TRUE ~ 0.010
+)
+
+C0_total <- N0_density * carriage_prob
+D0       <- 0.002 * N0_density * exp(-0.5 * ((age - 0.75) / 0.35)^2)
+S0_total <- pmax(N0_density - C0_total - D0, 0)
+
+S0 <- matrix(0, nrow = n_age, ncol = n_immunity, dimnames = list(NULL, immunity_classes))
+C0 <- matrix(0, nrow = n_age, ncol = n_immunity, dimnames = list(NULL, immunity_classes))
+
+S0[, "none"] <- S0_total * frac_none_by_age
+S0[, "low"]  <- S0_total * frac_low_by_age
+S0[, "high"] <- S0_total * frac_high_by_age
+
+C0[, "none"] <- C0_total * frac_none_by_age
+C0[, "low"]  <- C0_total * frac_low_by_age
+C0[, "high"] <- C0_total * frac_high_by_age
+
+initial_counts_df <- tibble(
+  age = age,
+  S_none = S0[, "none"] * da,
+  S_low  = S0[, "low"]  * da,
+  S_high = S0[, "high"] * da,
+  C_none = C0[, "none"] * da,
+  C_low  = C0[, "low"]  * da,
+  C_high = C0[, "high"] * da,
+  D      = D0 * da
+) |>
+  pivot_longer(-age, names_to = "compartment", values_to = "count")
+
+ggplot(initial_counts_df, aes(age, count, colour = compartment)) +
+  geom_line(linewidth = 1.0) +
+  scale_colour_manual(values = c(
+    S_none = "#1b9e77", S_low = "#66c2a5", S_high = "#a6d854",
+    C_none = "#fdae61", C_low = "#f46d43", C_high = "#d73027",
+    D      = "#7570b3"
+  )) +
+  labs(
+    title = paste0("Initial Population Counts per ", da, "-Year Age Bin"),
+    x = "Age (years)", y = "Number of Individuals"
+  )
+```
+
+# Core Numerical Pieces
+
+## Force of infection and birth influx
+The force of infection is now driven by **total carriers**, and the population total in the denominator now includes `C` and `D` as well as `S`.
+
+```{r forcing-functions-and-reaction-step}
+force_of_infection <- function(S, C, D, beta_matrix, susceptibility, infectiousness, age_group_idx, da, lambda_ext = 0.0005) {
+  total_S <- rowSums(S)
+  total_C <- rowSums(C)
+  total_pop_by_age <- total_S + total_C + D
+  
+  inf_bin <- infectiousness * total_C * da
+  pop_bin <- total_pop_by_age * da
+  
+  C_group <- numeric(4)
+  N_group <- numeric(4)
+  
+  c_agg <- tapply(inf_bin, age_group_idx, sum)
+  n_agg <- tapply(pop_bin, age_group_idx, sum)
+  
+  C_group[as.numeric(names(c_agg))] <- c_agg
+  N_group[as.numeric(names(n_agg))] <- n_agg
+  
+  prop_inf_group <- ifelse(N_group > 0, C_group / N_group, 0)
+  lambda_group <- as.vector(beta_matrix %*% prop_inf_group)
+  lambda_age <- lambda_group[age_group_idx] * susceptibility
+  lambda_age <- ifelse(is.na(lambda_age), 0, lambda_age) + lambda_ext
+  
+  return(lambda_age)
+}
+
+birth_influx <- function(S, C, D, fertility, da) {
+  total_S <- rowSums(S)
+  total_C <- rowSums(C)
+  sum(fertility * (total_S + total_C + D) * da)
+}
+
+age_transport_step <- function(u, boundary_value, dt, grid) {
+  transport_change <- tran.1D(
+    C = u, C.up = boundary_value, C.down = tail(u, 1),
+    v = 1, D = 0, dx = grid
+  )$dC
+  u + dt * transport_change
+}
+
+age_transport_step_matrix <- function(M, boundary_values, dt, grid) {
+  out <- M
+  for (j in seq_len(ncol(M))) {
+    out[, j] <- age_transport_step(M[, j], boundary_values[j], dt, grid)
+  }
+  out
+}
+
+pack_state <- function(S, C, D) {
+  c(as.vector(S), as.vector(C), D)
+}
+
+unpack_state <- function(y, n_age, n_immunity, immunity_classes) {
+  n_block <- n_age * n_immunity
+  S <- matrix(y[1:n_block], nrow = n_age, ncol = n_immunity, dimnames = list(NULL, immunity_classes))
+  C <- matrix(y[(n_block + 1):(2 * n_block)], nrow = n_age, ncol = n_immunity, dimnames = list(NULL, immunity_classes))
+  D <- y[(2 * n_block + 1):(2 * n_block + n_age)]
+  list(S = S, C = C, D = D)
+}
+
+reaction_rhs <- function(t, y, parms) {
+  with(parms, {
+    state <- unpack_state(y, n_age, n_immunity, immunity_classes)
+    
+    S_none <- state$S[, "none"]
+    S_low  <- state$S[, "low"]
+    S_high <- state$S[, "high"]
+    
+    C_none <- state$C[, "none"]
+    C_low  <- state$C[, "low"]
+    C_high <- state$C[, "high"]
+    
+    D      <- state$D
+    
+    lambda_none <- lambda 
+    lambda_low  <- lambda * (1 - alpha_L)
+    lambda_high <- lambda * (1 - alpha_H)
+    
+    sigma_none <- sigma
+    sigma_low  <- sigma * (1 - beta_L)
+    sigma_high <- sigma * (1 - beta_H)
+    
+    v_none_to_low <- if (!is.null(v_rate_none_to_low)) v_rate_none_to_low else numeric(n_age)
+    v_to_high     <- if (!is.null(v_rate_to_high)) v_rate_to_high else numeric(n_age)
+    
+    dS_none <- -(lambda_none + mortality + v_none_to_low + v_to_high) * S_none + wane_low_to_none * S_low
+    dS_low  <- -(lambda_low + wane_low_to_none + mortality + v_to_high) * S_low + wane_high_to_low * S_high + v_none_to_low * S_none
+    dS_high <- -(lambda_high + wane_high_to_low + mortality) * S_high + (C_none + C_low + C_high) * rho_C + rho_I * D + v_to_high * (S_none + S_low)
+    
+    dC_none <- lambda_none * S_none - (sigma_none + rho_C + mortality) * C_none
+    dC_low  <- lambda_low * S_low - (sigma_low + rho_C + mortality) * C_low
+    dC_high <- lambda_high * S_high - (sigma_high + rho_C + mortality) * C_high
+    
+    disease_inflow <- sigma_none * C_none + sigma_low * C_low + sigma_high * C_high
+    dD             <- disease_inflow - (rho_I + mortality) * D
+    
+    dS <- cbind(none = dS_none, low = dS_low, high = dS_high)
+    dC <- cbind(none = dC_none, low = dC_low, high = dC_high)
+    
+    dy <- c(as.vector(dS), as.vector(dC), as.vector(dD))
+    list(dy)
+  })
+}
+
+reaction_step_desolve <- function(
+  S_star, C_star, D_star, lambda, sigma, mortality, dt, n_age, n_immunity, 
+  immunity_classes, alpha_L, alpha_H, beta_L, beta_H, 
+  wane_high_to_low, wane_low_to_none, rho_C, rho_I, 
+  v_rate_none_to_low = NULL, v_rate_to_high = NULL
+) {
+  y_star <- pack_state(S_star, C_star, D_star)
+
+  sol <- ode(
+    y = y_star, times = c(0, dt), func = reaction_rhs,
+    parms = list(
+      lambda = lambda, sigma = sigma, mortality = mortality,
+      n_age = n_age, n_immunity = n_immunity, immunity_classes = immunity_classes,
+      alpha_L = alpha_L, alpha_H = alpha_H, beta_L = beta_L, beta_H = beta_H,
+      wane_high_to_low = wane_high_to_low, wane_low_to_none = wane_low_to_none,
+      rho_C = rho_C, rho_I = rho_I, 
+      v_rate_none_to_low = v_rate_none_to_low, v_rate_to_high = v_rate_to_high
+    ),
+    method = "radau", rtol = 1e-6, atol = 1e-8
+  )
+
+  unpack_state(sol[2, -1], n_age, n_immunity, immunity_classes)
+}
+
+simulate_mcvf_sir_imex_dynamic <- function(
+  S0, C0, D0, age, time, da, dt, grid, beta_matrix, age_group_idx, sigma,
+  susceptibility, infectiousness, fertility_matrix, mortality_matrix, 
+  n_immunity, immunity_classes, alpha_L, alpha_H, beta_L, beta_H, 
+  wane_high_to_low, wane_low_to_none, rho_C, rho_I,
+  frac_maternal_none, frac_maternal_low, frac_maternal_high,
+  v_rate_none_to_low_matrix = NULL, v_rate_to_high_matrix = NULL,
+  lambda_ext = 0.0005,
+  snapshot_times = c(0, 5, 10, 15, 20, 25, 30), heatmap_stride = 2
+) {
+  S <- S0
+  C <- C0
+  D <- D0
+  
+  n_age <- length(age)
+  summary_store  <- vector("list", length(time))
+  snapshot_store <- list()
+  snap_counter   <- 1
+
+  for (n in seq_along(time)) {
+    t_now <- time[n]
+
+    year_idx <- pmin(floor(t_now) + 1, if (is.matrix(mortality_matrix)) ncol(mortality_matrix) else 1)
+
+    mortality_now <- if (is.matrix(mortality_matrix)) mortality_matrix[, year_idx] else mortality_matrix
+    fertility_now <- if (is.matrix(fertility_matrix)) fertility_matrix[, year_idx] else fertility_matrix
+    
+    # Corrected indexing by simulation step n
+    v_none_to_low_now <- if (!is.null(v_rate_none_to_low_matrix)) v_rate_none_to_low_matrix[, n] else NULL
+    v_to_high_now     <- if (!is.null(v_rate_to_high_matrix)) v_rate_to_high_matrix[, n] else NULL
+
+    lambda_now <- force_of_infection(
+      S = S, C = C, D = D, 
+      beta_matrix = beta_matrix, 
+      susceptibility = susceptibility, 
+      infectiousness = infectiousness, 
+      age_group_idx = age_group_idx, 
+      da = da, 
+      lambda_ext = lambda_ext
+    )
+    
+    total_deaths_now <- sum(mortality_now * (rowSums(S) + rowSums(C) + D) * da)
+    births_now <- total_deaths_now
+
+    total_S_by_class <- colSums(S * da)
+    total_S          <- sum(total_S_by_class)
+    
+    total_C_by_class <- colSums(C * da)
+    total_C          <- sum(total_C_by_class)
+    
+    total_D <- sum(D * da)
+    total_N <- total_S + total_C + total_D
+    
+    carriage_incidence_now <- sum(lambda_now * rowSums(S) * da)
+    disease_incidence_now  <- sum(sigma * rowSums(C) * da)
+
+    summary_store[[n]] <- tibble(
+      time = t_now, 
+      year = 1990 + t_now,
+      S = total_S,
+      S_none = total_S_by_class["none"], S_low = total_S_by_class["low"], S_high = total_S_by_class["high"],
+      C = total_C,
+      C_none = total_C_by_class["none"], C_low = total_C_by_class["low"], C_high = total_C_by_class["high"],
+      D = total_D, N = total_N, births = births_now,
+      carriage_incidence = carriage_incidence_now, disease_incidence = disease_incidence_now,
+      mean_lambda = mean(lambda_now)
+    )
+
+    if (any(abs(t_now - snapshot_times) < dt / 2)) {
+      snapshot_store[[snap_counter]] <- tibble(
+        time = t_now, year = 1990 + t_now, age = age,
+        S_none_count = S[, "none"] * da, S_low_count = S[, "low"] * da, S_high_count = S[, "high"] * da,
+        C_none_count = C[, "none"] * da, C_low_count = C[, "low"] * da, C_high_count = C[, "high"] * da,
+        D_count      = D * da,
+        total_carriage_count = rowSums(C) * da,
+        total_disease_count  = D * da,
+        new_disease_cases_per_year = (sigma * rowSums(C)) * da
+      )
+      snap_counter <- snap_counter + 1
+    }
+
+    if (n == length(time)) break
+    
+    S_boundary <- c(none = births_now * frac_maternal_none,
+                    low  = births_now * frac_maternal_low,
+                    high = births_now * frac_maternal_high)[immunity_classes]
+    C_boundary <- c(none = 0, low = 0, high = 0)[immunity_classes]
+    D_boundary <- 0
+
+    S_star <- age_transport_step_matrix(S, S_boundary, dt, grid)
+    C_star <- age_transport_step_matrix(C, C_boundary, dt, grid)
+    D_star <- age_transport_step(D, D_boundary, dt, grid)
+
+    react <- reaction_step_desolve(
+      S_star = S_star, C_star = C_star, D_star = D_star,
+      lambda = lambda_now, sigma = sigma, mortality = mortality_now, dt = dt,
+      n_age = n_age, n_immunity = n_immunity, immunity_classes = immunity_classes,
+      alpha_L = alpha_L, alpha_H = alpha_H, beta_L = beta_L, beta_H = beta_H,
+      wane_high_to_low = wane_high_to_low, wane_low_to_none = wane_low_to_none,
+      rho_C = rho_C, rho_I = rho_I,
+      v_rate_none_to_low = v_none_to_low_now,
+      v_rate_to_high = v_to_high_now
+    )
+
+    S <- pmax(react$S, 0)
+    C <- pmax(react$C, 0)
+    D <- pmax(react$D, 0)
+  }
+
+  list(
+    summary     = bind_rows(summary_store),
+    snapshots   = bind_rows(snapshot_store),
+    final_state = list(S = S, C = C, D = D)
+  )
+}
+```
+
+# Run the Simulation
+
+```{r run-simulation}
+# ==============================================================================
+# 1. BURN-IN TO ENDEMIC EQUILIBRIUM (NO VAX)
+# ==============================================================================
+message("Running 100-year burn-in to establish equilibrium initial conditions...")
+burnin_horizon <- 100
+time_burnin    <- seq(0, burnin_horizon, by = dt)
+
+out_burnin <- simulate_mcvf_sir_imex_dynamic(
+  S0 = S0, C0 = C0, D0 = D0, age = age, time = time_burnin, da = da, dt = dt, grid = grid,
+  beta_matrix = beta_matrix, age_group_idx = age_group_idx, sigma = sigma, 
+  susceptibility = susceptibility, infectiousness = infectiousness,
+  fertility_matrix = fertility_mat_burnin, 
+  mortality_matrix = mortality_mat_burnin, 
+  n_immunity = n_immunity, immunity_classes = immunity_classes,
+  alpha_L = alpha_L, alpha_H = alpha_H, beta_L = beta_L, beta_H = beta_H,
+  wane_high_to_low = wane_high_to_low, wane_low_to_none = wane_low_to_none,
+  rho_C = rho_C, rho_I = rho_I,
+  frac_maternal_none = frac_maternal_none, frac_maternal_low = frac_maternal_low,
+  frac_maternal_high = frac_maternal_high, 
+  snapshot_times = c(0, 50, 100)
+)
+
+S0_eq <- out_burnin$final_state$S
+C0_eq <- out_burnin$final_state$C
+D0_eq <- out_burnin$final_state$D
+
+# ==============================================================================
+# 2. RUN COUNTERFACTUAL SCENARIO (30 YEARS, NO VAX, DYNAMIC DEMOGRAPHICS)
+# ==============================================================================
+message("Running 30-year counterfactual scenario (1990-2020)...")
+out_counterfactual <- simulate_mcvf_sir_imex_dynamic(
+  S0 = S0_eq, C0 = C0_eq, D0 = D0_eq, age = age, time = time_vax, da = da, dt = dt, grid = grid,
+  beta_matrix = beta_matrix, age_group_idx = age_group_idx, sigma = sigma,
+  susceptibility = susceptibility, infectiousness = infectiousness,
+  fertility_matrix = fertility_mat_scaled,
+  mortality_matrix = mortality_mat,
+  n_immunity = n_immunity, immunity_classes = immunity_classes,
+  alpha_L = alpha_L, alpha_H = alpha_H, beta_L = beta_L, beta_H = beta_H,
+  wane_high_to_low = wane_high_to_low, wane_low_to_none = wane_low_to_none,
+  rho_C = rho_C, rho_I = rho_I,
+  frac_maternal_none = frac_maternal_none, frac_maternal_low = frac_maternal_low,
+  frac_maternal_high = frac_maternal_high,
+  v_rate_none_to_low_matrix = NULL,
+  v_rate_to_high_matrix = NULL
+)
+
+# ==============================================================================
+# 3. RUN VACCINATION SCENARIO (30 YEARS, REALISTIC HIB VAX, DYNAMIC DEMOGRAPHICS)
+# ==============================================================================
+message("Running 30-year Hib vaccination scenario (1990-2020)...")
+out_vax <- simulate_mcvf_sir_imex_dynamic(
+  S0 = S0_eq, C0 = C0_eq, D0 = D0_eq, age = age, time = time_vax, da = da, dt = dt, grid = grid,
+  beta_matrix = beta_matrix, age_group_idx = age_group_idx, sigma = sigma,
+  susceptibility = susceptibility, infectiousness = infectiousness,
+  fertility_matrix = fertility_mat_scaled,
+  mortality_matrix = mortality_mat,
+  n_immunity = n_immunity, immunity_classes = immunity_classes,
+  alpha_L = alpha_L, alpha_H = alpha_H, beta_L = beta_L, beta_H = beta_H,
+  wane_high_to_low = wane_high_to_low, wane_low_to_none = wane_low_to_none,
+  rho_C = rho_C, rho_I = rho_I,
+  frac_maternal_none = frac_maternal_none, frac_maternal_low = frac_maternal_low,
+  frac_maternal_high = frac_maternal_high,
+  v_rate_none_to_low_matrix = v_rate_none_to_low_matrix,
+  v_rate_to_high_matrix = v_rate_to_high_matrix
+)
+```
+
+
+```{r diff-analysis}
+# ==============================================================================
+# DIFFERENCING ANALYSIS & METRICS COMPUTATION (1990 - 2020)
+# ==============================================================================
+cfr_hib <- 0.05
+
+summary_counter <- out_counterfactual$summary %>% mutate(scenario = "Counterfactual (No Vax)")
+summary_vax     <- out_vax$summary %>% mutate(scenario = "Hib Vaccination Program")
+
+comp_df <- summary_counter %>%
+  filter(time < 30) %>%
+  select(time, year, N, disease_incidence_counter = disease_incidence) %>%
+  inner_join(
+    summary_vax %>% filter(time < 30) %>% select(time, disease_incidence_vax = disease_incidence),
+    by = "time"
+  ) %>%
+  mutate(
+    annual_cases_counter = disease_incidence_counter * dt,
+    annual_cases_vax     = disease_incidence_vax * dt,
+    cases_averted_dt     = annual_cases_counter - annual_cases_vax,
+    
+    annual_deaths_counter = annual_cases_counter * cfr_hib,
+    annual_deaths_vax     = annual_cases_vax * cfr_hib,
+    deaths_averted_dt     = cases_averted_dt * cfr_hib,
+    
+    rate_100k_counter = (disease_incidence_counter / N) * 100000,
+    rate_100k_vax     = (disease_incidence_vax / N) * 100000
+  )
+
+annual_impact <- comp_df %>%
+  group_by(year = floor(year)) %>%
+  summarize(
+    pop_size              = mean(N),
+    cases_counter         = sum(annual_cases_counter),
+    cases_vax             = sum(annual_cases_vax),
+    cases_averted         = sum(cases_averted_dt),
+    deaths_counter        = sum(annual_deaths_counter),
+    deaths_vax            = sum(annual_deaths_vax),
+    deaths_averted        = sum(deaths_averted_dt),
+    pct_case_reduction    = (1 - cases_vax / cases_counter) * 100,
+    .groups = "drop"
+  ) %>%
+  mutate(
+    cum_cases_averted  = cumsum(cases_averted),
+    cum_deaths_averted = cumsum(deaths_averted)
+  )
+
+tot_cases_counter <- sum(annual_impact$cases_counter)
+tot_cases_vax     <- sum(annual_impact$cases_vax)
+tot_cases_averted <- sum(annual_impact$cases_averted)
+
+tot_deaths_counter <- sum(annual_impact$deaths_counter)
+tot_deaths_vax     <- sum(annual_impact$deaths_vax)
+tot_deaths_averted <- sum(annual_impact$deaths_averted)
+overall_pct_red    <- (1 - tot_cases_vax / tot_cases_counter) * 100
+
+cumulative_summary <- tibble(
+  Metric = c("Total Severe Cases", "Total Deaths", "Overall Reduction (%)"),
+  `Counterfactual Scenario` = c(round(tot_cases_counter), round(tot_deaths_counter), "—"),
+  `Hib Vaccination Program` = c(round(tot_cases_vax), round(tot_deaths_vax), "—"),
+  `Net Averted / Impact`    = c(round(tot_cases_averted), round(tot_deaths_averted), paste0(round(overall_pct_red, 1), "%"))
+)
+
+kable(cumulative_summary, caption = "30-Year Cumulative Impact Analysis (1990–2020)")
+
+```
+
+
+```{r counterfactual-vs-vaccination-trajectories}
+# Plot 1: Annual Severe Disease Cases Trajectory
+ggplot() +
+  geom_line(data = comp_df, aes(x = year, y = disease_incidence_counter, color = "Counterfactual (No Vax)"), linewidth = 1.2) +
+  geom_line(data = comp_df, aes(x = year, y = disease_incidence_vax, color = "Hib Vaccination Program"), linewidth = 1.2) +
+  scale_color_manual(values = c("Counterfactual (No Vax)" = "#D95F02", "Hib Vaccination Program" = "#1B9E77")) +
+  labs(
+    title = "Annual Severe Invasive Hib Cases (1990–2020)",
+    subtitle = "Navajo Nation 30-Year Simulation with Dynamic Demographics",
+    x = "Calendar Year",
+    y = "Annual Severe Disease Cases",
+    color = "Scenario"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom", plot.title = element_text(face = "bold"))
+
+plot_cum <- annual_impact %>%
+  select(year, cum_cases_averted, cum_deaths_averted) %>%
+  pivot_longer(-year, names_to = "metric", values_to = "count") %>%
+  mutate(metric = ifelse(metric == "cum_cases_averted", "Cumulative Severe Cases Averted", "Cumulative Deaths Averted"))
+
+ggplot(plot_cum, aes(x = year, y = count, fill = metric)) +
+  geom_area(alpha = 0.7, color = "black", linewidth = 0.3, position = "identity") +
+  facet_wrap(~ metric, scales = "free_y", ncol = 1) +
+  scale_fill_manual(values = c("Cumulative Severe Cases Averted" = "#2B8CBE", "Cumulative Deaths Averted" = "#E6550D")) +
+  labs(
+    title = "Cumulative Public Health Impact of Hib Vaccination (1990–2020)",
+    x = "Calendar Year",
+    y = "Cumulative Quantity Averted"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "none", plot.title = element_text(face = "bold"))
+```
+
+
+
+
+```{r postvax-plots-one}
+# ==============================================================================
+# 4. PLOT INCIDENCE IMPACT POST-VACCINATION
+# ==============================================================================
+summary_vax_df <- out_vax$summary %>%
+  mutate(
+    total_pop = S_none + S_low + S_high + C_none + C_low + C_high + D,
+    disease_rate_per_100k  = (disease_incidence / total_pop) * 100000,
+    carriage_rate_per_100k = (carriage_incidence / total_pop) * 100000
+  )
+
+ggplot(summary_vax_df, aes(x = time)) +
+  geom_line(aes(y = disease_rate_per_100k, color = "Invasive Disease"), linewidth = 1.2) +
+  geom_line(aes(y = carriage_rate_per_100k / 100, color = "Carriage (x1/100)"), linewidth = 1, linetype = "dashed") +
+  labs(
+    title = "Impact of Routine Pediatric Vaccination",
+    subtitle = "Simulation initialized from burn-in endemic equilibrium",
+    x = "Years Since Vaccination Implementation",
+    y = "Incidence Rate per 100,000",
+    color = "Metric"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom", plot.title = element_text(face = "bold"))
+
+```
+
+```{r postvax-plots-two}
+ggplot(summary_vax_df, aes(x = time, y = disease_rate_per_100k)) +
+  geom_line(color = "#D55E00", linewidth = 1.2) +
+  labs(
+    title = "Impact of Routine Pediatric Vaccination on Severe Invasive Disease",
+    subtitle = "Overall population incidence following burn-in equilibrium",
+    x = "Years Since Vaccination Implementation",
+    y = "Severe Disease Incidence Rate per 100,000"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"))
+
+```
+
+```{r postvax-plots-three}
+# Calculate incidence per 100,000 specifically for age < 5
+under5_vax_df <- out_vax$snapshots %>%
+  filter(age < 5) %>%
+  group_by(time) %>%
+  summarize(
+    new_cases_under5 = sum(new_disease_cases_per_year),
+    pop_under5       = sum(S_none_count + S_low_count + S_high_count + 
+                           C_none_count + C_low_count + C_high_count + D_count),
+    disease_rate_under5_per_100k = (new_cases_under5 / pop_under5) * 100000,
+    .groups = "drop"
+  )
+
+ggplot(under5_vax_df, aes(x = time, y = disease_rate_under5_per_100k)) +
+  geom_line(color = "#1170AA", linewidth = 1.2) +
+  labs(
+    title = "Impact of Routine Pediatric Vaccination on Severe Disease (<5 Years)",
+    subtitle = "Incidence among children under 5 following burn-in equilibrium",
+    x = "Years Since Vaccination Implementation",
+    y = "Severe Disease Incidence Rate per 100,000 (<5 yrs)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+```{r tests}
+#1. 
+library(ggplot2)
+
+ggplot(out_counterfactual$summary, aes(x = year, y = births)) +
+  geom_line(color = "#e41a1c", linewidth = 1) +
+  theme_minimal() +
+  labs(
+    title = "Counterfactual: Annual Birth Influx Over Time",
+    x = "Year",
+    y = "Annual Births"
+  )
+
+#2. 
+library(dplyr)
+library(tidyr)
+
+out_counterfactual$summary |>
+  mutate(
+    incidence_per_100k = (disease_incidence / N) * 100000
+  ) |>
+  pivot_longer(
+    cols = c(disease_incidence, incidence_per_100k),
+    names_to = "metric",
+    values_to = "val"
+  ) |>
+  ggplot(aes(x = year, y = val, color = metric)) +
+  geom_line(linewidth = 1) +
+  facet_wrap(~ metric, scales = "free_y", labeller = as_labeller(c(
+    disease_incidence = "Raw Annual Cases",
+    incidence_per_100k = "Incidence Rate (per 100,000)"
+  ))) +
+  theme_minimal() +
+  theme(legend.position = "none") +
+  labs(
+    title = "Counterfactual: Raw Cases vs. Crude Incidence Rate",
+    x = "Year", 
+    y = "Value"
+  )
+
+#3.
+# Construct static 1990 demographic matrices by repeating column 1
+n_cols <- ncol(mortality_mat)
+
+mortality_mat_static <- matrix(
+  mortality_mat[, 1], 
+  nrow = nrow(mortality_mat), 
+  ncol = n_cols
+)
+
+fertility_mat_static <- matrix(
+  fertility_mat_scaled[, 1], 
+  nrow = nrow(fertility_mat_scaled), 
+  ncol = n_cols
+)
+
+# Run counterfactual with constant 1990 demography
+out_static_counterfactual <- simulate_mcvf_sir_imex_dynamic(
+  S0 = S0_eq, C0 = C0_eq, D0 = D0_eq, age = age, time = time_vax, da = da, dt = dt, grid = grid,
+  beta_matrix = beta_matrix, age_group_idx = age_group_idx, sigma = sigma,
+  susceptibility = susceptibility, infectiousness = infectiousness,
+  fertility_matrix = fertility_mat_static,
+  mortality_matrix = mortality_mat_static,
+  n_immunity = n_immunity, immunity_classes = immunity_classes,
+  alpha_L = alpha_L, alpha_H = alpha_H, beta_L = beta_L, beta_H = beta_H,
+  wane_high_to_low = wane_high_to_low, wane_low_to_none = wane_low_to_none,
+  rho_C = rho_C, rho_I = rho_I,
+  frac_maternal_none = frac_maternal_none, frac_maternal_low = frac_maternal_low,
+  frac_maternal_high = frac_maternal_high,
+  v_rate_none_to_low_matrix = NULL,
+  v_rate_to_high_matrix = NULL
+)
+
+# Plot comparison between dynamic and static counterfactuals
+bind_rows(
+  out_counterfactual$summary |> mutate(demographics = "Dynamic (1990-2020)"),
+  out_static_counterfactual$summary |> mutate(demographics = "Static (1990 Constant)")
+) |>
+  ggplot(aes(x = year, y = disease_incidence, color = demographics)) +
+  geom_line(linewidth = 1) +
+  theme_minimal() +
+  labs(
+    title = "Counterfactual Cases: Dynamic vs. Static Demographics",
+    x = "Year",
+    y = "Annual Disease Cases",
+    color = "Demographic Setup"
+  )
+```
+
+```{r dx-two}
+library(ggplot2)
+library(patchwork)
+
+# 1. Check if total population N is shrinking in static run
+p1 <- ggplot(out_static_counterfactual$summary, aes(x = year, y = N)) +
+  geom_line(color = "black", linewidth = 1) +
+  theme_minimal() +
+  labs(title = "Total Population (N)", y = "Count")
+
+# 2. Check if burn-in actually reached steady state at year 20
+p2 <- ggplot(out_burnin$summary, aes(x = time, y = disease_incidence)) +
+  geom_line(color = "darkblue", linewidth = 1) +
+  theme_minimal() +
+  labs(title = "Burn-In Trajectory (0-20 yrs)", x = "Burn-in Year", y = "Raw Cases")
+
+# 3. Check Per-Capita Incidence Rate vs Raw Cases
+p3 <- out_static_counterfactual$summary |>
+  mutate(rate_per_100k = (disease_incidence / N) * 100000) |>
+  ggplot(aes(x = year, y = rate_per_100k)) +
+  geom_line(color = "darkgreen", linewidth = 1) +
+  theme_minimal() +
+  labs(title = "Per-Capita Incidence Rate", y = "Cases / 100k")
+
+(p1 | p2) / p3
+```
+
+```{r dx-three}
+library(dplyr)
+library(ggplot2)
+
+# ==============================================================================
+# 1. BURN-IN CONVERGENCE CHECK
+# Checks if dY/dt reaches equilibrium (~0) at the end of out_burnin
+# ==============================================================================
+check_burnin_convergence <- function(burnin_obj, state_cols = c("S", "I", "R")) {
+  # Extract data frame from list wrapper if out_burnin isn't a plain matrix/data frame
+  if (is.list(burnin_obj) && !is.data.frame(burnin_obj)) {
+    if ("sim" %in% names(burnin_obj)) {
+      df <- as.data.frame(burnin_obj$sim)
+    } else if ("out" %in% names(burnin_obj)) {
+      df <- as.data.frame(burnin_obj$out)
+    } else {
+      matrix_idx <- which(sapply(burnin_obj, function(x) is.matrix(x) || is.data.frame(x)))[1]
+      if (length(matrix_idx) == 0 || is.na(matrix_idx)) {
+        stop("Could not automatically locate simulation matrix inside out_burnin list")
+      }
+      df <- as.data.frame(burnin_obj[[matrix_idx]])
+    }
+  } else {
+    df <- as.data.frame(burnin_obj)
+  }
+  
+  n_rows <- nrow(df)
+  if (is.null(n_rows) || n_rows < 2) stop("Input must have at least 2 time steps")
+  
+  time_col <- if ("time" %in% names(df)) "time" else if ("year" %in% names(df)) "year" else names(df)[1]
+  t_step <- df[[time_col]][n_rows] - df[[time_col]][n_rows - 1]
+  
+  # Calculate derivatives, summing across stratified sub-compartments if present
+  derivs <- sapply(state_cols, function(prefix) {
+    matching_cols <- grep(paste0("^", prefix, "($|\\[|_|\\.)"), names(df), value = TRUE)
+    if (length(matching_cols) == 0) {
+      stop(paste("No columns matching pattern for state:", prefix))
+    }
+    
+    val_curr <- sum(unlist(df[n_rows, matching_cols, drop = FALSE]))
+    val_prev <- sum(unlist(df[n_rows - 1, matching_cols, drop = FALSE]))
+    
+    (val_curr - val_prev) / t_step
+  })
+  
+  cat("=== Burn-In Terminal Derivatives (dState/dt) ===\n")
+  print(round(derivs, 5))
+  
+  unstable <- names(derivs[abs(derivs) > 1e-3])
+  if (length(unstable) > 0) {
+    message("Warning: Compartments not fully converged: ", paste(unstable, collapse = ", "))
+  } else {
+    message("System reached equilibrium at end of burn-in")
+  }
+}
+
+# ==============================================================================
+# 2. DEMOGRAPHIC & PROPORTION SHIFT CHECK
+# Checks if declining N(t) is altering S/N, I/N, or R/N ratios
+# ==============================================================================
+check_proportions <- function(sim_obj) {
+  df <- as.data.frame(sim_obj) %>%
+    mutate(
+      N_t = S + I + R,
+      prop_S = S / N_t,
+      prop_I = I / N_t,
+      prop_R = R / N_t
+    )
+  
+  cat("\n=== 2. State Proportions (Start vs End) ===\n")
+  cat("Start: Prop S =", round(head(df$prop_S, 1), 5), 
+      "| Prop I =", round(head(df$prop_I, 1), 5), "\n")
+  cat("End:   Prop S =", round(tail(df$prop_S, 1), 5), 
+      "| Prop I =", round(tail(df$prop_I, 1), 5), "\n")
+  
+  p <- ggplot(df, aes(x = if ("year" %in% names(df)) year else time)) +
+    geom_line(aes(y = prop_S, color = "S / N"), linewidth = 1) +
+    geom_line(aes(y = prop_I * 1000, color = "I / N (x1000)"), linewidth = 1) +
+    labs(
+      title = "Compartment Proportions Over Time",
+      x = "Time", 
+      y = "Proportion",
+      color = "Compartment"
+    ) +
+    theme_minimal()
+  
+  print(p)
+  return(df)
+}
+
+# ==============================================================================
+# 3. INCIDENCE FORMULATION COMPARISON
+# Compares dynamic N(t) denominator vs static initial N denominator
+# ==============================================================================
+library(dplyr)
+library(ggplot2)
+
+check_incidence_scaling <- function(sim_obj, cases_col = "new_cases") {
+  df <- as.data.frame(sim_obj)
+  
+  if (!cases_col %in% names(df)) {
+    stop(paste("Cases column", cases_col, "not found in data frame"))
+  }
+  
+  initial_N <- df$S[1] + df$I[1] + df$R[1]
+  
+  df <- df %>%
+    mutate(
+      N_t = S + I + R,
+      inc_dynamic = (.data[[cases_col]] / N_t) * 100000,
+      inc_static  = (.data[[cases_col]] / initial_N) * 100000
+    )
+  
+  cat("\n=== 3. Incidence Rate Comparison ===\n")
+  cat("Start - Dynamic N(t):", round(head(df$inc_dynamic, 1), 2), "| Static N0:", round(head(df$inc_static, 1), 2), "\n")
+  cat("End   - Dynamic N(t):", round(tail(df$inc_dynamic, 1), 2), "| Static N0:", round(tail(df$inc_static, 1), 2), "\n")
+  
+  time_var <- if ("year" %in% names(df)) "year" else "time"
+  
+  p <- ggplot(df, aes(x = .data[[time_var]])) +
+    geom_line(aes(y = inc_dynamic, color = "Dynamic N(t) Denominator"), linewidth = 1) +
+    geom_line(aes(y = inc_static, color = "Static N0 Denominator"), linetype = "dashed", linewidth = 1) +
+    labs(
+      title = "Incidence Rate Sensitivity to Population Denominator",
+      x = "Time", 
+      y = "Cases / 100k",
+      color = "Formulation"
+    ) +
+    theme_minimal()
+  
+  print(p)
+  return(df)
+}
+
+# ==============================================================================
+# EXECUTION
+# ==============================================================================
+# 1. Run burn-in check using out_burnin directly
+check_burnin_convergence(out_burnin, state_cols = c("S", "I", "R"))
+
+# 2. Run main simulation proportion check (pass your 1990-2020 object name here)
+sim_props <- check_proportions(out_vax)
+
+# 3. Run incidence scaling check (update 'new_cases' if your column is named differently)
+sim_inc <- check_incidence_scaling(out_main, cases_col = "new_cases")
+
+
+library(dplyr)
+library(ggplot2)
+
+check_burnin_convergence <- function(burnin_list, state_cols = c("S", "C", "D")) {
+  df <- as.data.frame(burnin_list$summary)
+  n_rows <- nrow(df)
+  
+  # Keep only columns that exist in the summary table
+  valid_cols <- intersect(state_cols, names(df))
+  if (length(valid_cols) == 0) {
+    stop("None of the specified state_cols exist in out_burnin$summary")
+  }
+  
+  time_col <- if ("time" %in% names(df)) "time" else if ("year" %in% names(df)) "year" else names(df)[1]
+  t_step <- df[[time_col]][n_rows] - df[[time_col]][n_rows - 1]
+  
+  derivs <- sapply(valid_cols, function(col) {
+    (df[[col]][n_rows] - df[[col]][n_rows - 1]) / t_step
+  })
+  
+  cat("=== 1. Burn-In Terminal Derivatives (dState/dt) ===\n")
+  print(round(derivs, 5))
+  
+  unstable <- names(derivs[abs(derivs) > 1e-2])
+  if (length(unstable) > 0) {
+    message("Warning: Compartments still shifting: ", paste(unstable, collapse = ", "))
+  } else {
+    message("System reached steady-state equilibrium at end of burn-in")
+  }
+}
+
+# Run burn-in check
+check_burnin_convergence(out_burnin, state_cols = c("S", "C", "D"))
+```
+
+
+
+#pop totals over time
+```{r pop-totals}
+summary_long <- summary_df |>
+  select(time, S, C, D) |>
+  pivot_longer(-time, names_to = "compartment", values_to = "persons")
+
+ggplot(summary_long, aes(time, persons, colour = compartment)) +
+  geom_line(linewidth = 1.0) +
+  scale_colour_manual(values = c(S = "#1b9e77", C = "#d95f02", D = "#7570b3")) +
+  labs(
+    title = paste0("Total Population Mass Across Compartments (N = ", format(N_target, big.mark=","), ")"),
+    x = "Time (years)", y = "Total Persons"
+  )
+
+```
+
+#incidence counts
+```{r incidence-counts}
+summary_aux <- summary_df |>
+  select(time, carriage_incidence, disease_incidence, births) |>
+  pivot_longer(-time, names_to = "quantity", values_to = "value")
+
+ggplot(summary_aux, aes(time, value)) +
+  geom_line(linewidth = 1.0, colour = "#2c7fb8") +
+  facet_wrap(~ quantity, scales = "free_y", ncol = 1) +
+  labs(
+    title = "Annualized Absolute Incidence Counts & Births",
+    x = "Time (years)", y = "Persons / Year"
+  )
+
+```
+
+#age-specific counts over time
+```{r age-counts}
+snapshot_counts_long <- snapshots_df |>
+  pivot_longer(
+    cols = c(S_none_count, S_low_count, S_high_count, 
+             C_none_count, C_low_count, C_high_count, D_count),
+    names_to = "compartment", values_to = "count"
+  ) |>
+  mutate(
+    compartment = gsub("_count", "", compartment),
+    time_label  = paste0("t = ", format(round(time, 1), nsmall = 1))
+  )
+
+ggplot(snapshot_counts_long, aes(age, count, colour = compartment)) +
+  geom_line(linewidth = 0.9) +
+  facet_grid(compartment ~ time_label, scales = "free_y") +
+  scale_colour_manual(values = c(
+    S_none = "#1b9e77", S_low = "#66c2a5", S_high = "#a6d854",
+    C_none = "#fdae61", C_low = "#f46d43", C_high = "#d73027",
+    D      = "#7570b3"
+  )) +
+  labs(
+    title = paste0("Age Profiles by Compartment (Counts per ", da, "-Year Bin)"),
+    x = "Age (years)", y = "Number of Individuals"
+  ) +
+  theme(legend.position = "none")
+
+```
+
+#childhood (<5 y-o) invasive disease cases
+```{r child-cases}
+snapshots_df |>
+  filter(age <= 5) |>
+  mutate(time_label = paste0("t = ", format(round(time, 1), nsmall = 1))) |>
+  ggplot(aes(age, new_disease_cases_per_year, colour = time_label)) +
+  geom_line(linewidth = 1.1) +
+  labs(
+    title = "Annualized New Invasive Hib Cases by Age (<5 Years)",
+    x = "Age (years)", y = "New Cases / Year (per Bin)", colour = "Time Step"
+  )
+
+```
+
+library(dplyr)
+library(ggplot2)
+
+```{r per-100k-incidence}
+# 1. Transform summary_df to add per 100k rates
+summary_rates_df <- summary_df %>%
+   mutate(total_pop = S_none + S_low + S_high + C_none + C_low + C_high + D) %>%
+  mutate(
+    birth_rate_per_100k    = (births / total_pop) * 100000,
+    carriage_rate_per_100k = (carriage_incidence / total_pop) * 100000,
+    disease_rate_per_100k  = (disease_incidence / total_pop) * 100000
+  )
+
+# 2. Reshape to long format for clean multi-panel ggplotting
+library(tidyr)
+
+plot_df <- summary_rates_df %>%
+  select(time, birth_rate_per_100k, carriage_rate_per_100k, disease_rate_per_100k) %>%
+  pivot_longer(
+    cols = -time,
+    names_to = "metric",
+    values_to = "rate_per_100k"
+  ) %>%
+  mutate(
+    metric = factor(
+      metric,
+      levels = c("birth_rate_per_100k", "carriage_rate_per_100k", "disease_rate_per_100k"),
+      labels = c("Birth Rate (per 100k)", "Carriage Incidence (per 100k)", "Disease Incidence (per 100k)")
+    )
+  )
+
+ggplot(plot_df, aes(x = time, y = rate_per_100k)) +
+  geom_line(color = "#1f77b4", linewidth = 1) +
+  facet_wrap(~ metric, ncol = 1, scales = "free_y") +
+  scale_x_continuous(breaks = seq(0, 12, by = 2.5)) +
+  labs(
+    title = "Annualized Incidence Rates per 100,000 Population",
+    x = "Time (years)",
+    y = "Rate per 100,000 Person-Years"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    strip.text = element_text(size = 11),
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(hjust = 0.5)
+  )
+```
+
+# Aggregate Dynamics
+These are the total susceptible, infectious, and recovered masses after integrating over age.
+
+```{r aggregate-dynamics}
+summary_long <- summary_df |>
+  select(time, S, C, D) |>
+  pivot_longer(-time, names_to = "compartment", values_to = "mass")
+
+ggplot(summary_long, aes(time, mass, colour = compartment)) +
+  geom_line(linewidth = 1.0) +
+  scale_colour_manual(values = c(S = "#1b9e77", C = "#d95f02", D = "#7570b3")) +
+  labs(
+    title = "Aggregate SCD dynamics",
+    x = "Time (years)",
+    y = "Total mass"
+  )
+```
+
+```{r incidence-and-births}
+summary_aux <- summary_df |>
+  select(time, carriage_incidence, disease_incidence, births, mean_lambda) |>
+  pivot_longer(-time, names_to = "quantity", values_to = "value")
+
+ggplot(summary_aux, aes(time, value)) +
+  geom_line(linewidth = 1.0, colour = "#2c7fb8") +
+  facet_wrap(~ quantity, scales = "free_y", ncol = 1) +
+  labs(
+    title = "Carriage/disease incidence, births, and mean force of infection",
+    x = "Time (years)",
+    y = NULL
+  )
+```
+
+# Age Profiles at Selected Times
+```{r age-profiles}
+snapshot_long <- snapshots_df |>
+  pivot_longer(
+    cols = c(S_none_count, S_low_count, S_high_count,
+             C_none_count, C_low_count, C_high_count, D_count),
+    names_to = "compartment", values_to = "density"
+  ) |>
+  mutate(
+    compartment = gsub("_count", "", compartment),
+    time_label  = paste0("t = ", format(round(time, 1), nsmall = 1))
+  )
+
+ggplot(snapshot_long, aes(age, density, colour = compartment)) +
+  geom_line(linewidth = 0.9) +
+  facet_grid(compartment ~ time_label, scales = "free_y") +
+  scale_colour_manual(values = c(
+  S_none = "#1b9e77", S_low = "#66c2a5", S_high = "#a6d854",
+    C_none = "#fdae61", C_low = "#f46d43", C_high = "#d73027",
+    D = "#7570b3"
+)) +
+  labs(
+    title = "Age profiles of S, C, and D at selected times",
+    x = "Age (years)",
+    y = "Density"
+  ) +
+  theme(legend.position = "none")
+```
