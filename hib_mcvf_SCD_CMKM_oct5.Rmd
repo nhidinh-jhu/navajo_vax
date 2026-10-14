@@ -1,5 +1,5 @@
 ---
-title: "A McKendrick-von Foerster Age-Structured SIRS Model With Immunity in R"
+title: "Navajo Nation Hib Mcv Model"
 author: ""
 date: "`r format(Sys.Date(), '%B %d, %Y')`"
 output:
@@ -47,13 +47,17 @@ stopifnot(cfl <= 1) # Sanity check for CFL condition
 # Population scale
 N_target <- 200000 
 
-# Age distribution/shape
-N0_shape <- exp(-0.035 * age) 
-N0_shape <- N0_shape / sum(N0_shape * da)
+# Calculate the true stable survival curve directly from baseline mortality
+survival_stable <- exp(-cumsum(mortality_base) * da)
+survival_stable <- c(1, head(survival_stable, -1)) # Start at age 0 with survival = 1
 
-# Population density scaled to N_target persons
-N0_density <- N0_shape * N_target
+# Normalize to get the stable age shape
+N0_shape_stable <- survival_stable / sum(survival_stable * da)
 
+# Scale precisely to your N_target (200,000 persons)
+N0_density <- N0_shape_stable * N_target
+
+# Beta transmission parameter set to estimated values for Alaska Native populatio per Jackson et al.
 beta_matrix <- matrix(c(
     2.11, 0.15, 0.53, 0.03,  #[0,1]
     0.55, 0.40, 0.50, 0.12,  #[2,4]
@@ -71,9 +75,7 @@ age_group_idx <- dplyr::case_when(
 susceptibility <- rep(1, length(age))
 infectiousness <- rep(1, length(age))
 
-# ==============================================================================
 # DEMOGRAPHIC TIME-VARYING MATRICES
-# ==============================================================================
 demo_time <- seq(0, 50, by = 1)
 n_demo_time <- length(demo_time)
 
@@ -81,7 +83,7 @@ mortality_base <- 0.008 + 0.06 / (1 + exp(-(age - 72) / 5))
 fertility_raw_base <- exp(-0.5 * ((age - 22) / 6)^2)
 
 mortality_decline <- 0.99^(demo_time)
-fertility_drop <- seq(1, 0.7, length.out = n_demo_time)
+fertility_drop <- seq(1, 0.95, length.out = n_demo_time)
 
 mortality_mat <- matrix(NA, nrow = n_age, ncol = n_demo_time)
 fertility_mat <- matrix(NA, nrow = n_age, ncol = n_demo_time)
@@ -103,9 +105,7 @@ fertility_mat_scaled[, 1] <- fertility_mat_scaled[, 1] * (total_deaths_base / ra
 fertility_mat_burnin <- matrix(fertility_mat_scaled[, 1], nrow = n_age, ncol = n_demo_time)
 mortality_mat_burnin <- matrix(mortality_mat[, 1], nrow = n_age, ncol = n_demo_time)
 
-# ==============================================================================
 # DISEASE & IMMUNITY PARAMETERS
-# ==============================================================================
 sigma_base_annual <- 3.50e-5 * 52.1775
 sigma_amp_annual  <- 0.01591 * 52.1775
 decay_rate_weekly <- 0.0371
@@ -161,30 +161,32 @@ ggplot(ingredient_df, aes(age, value)) +
     x = "Age (years)", y = "Value"
   )
 
-# ==============================================================================
 # REALISTIC HIB DOSE SCHEDULE & TIME-VARYING VACCINATION MATRIX
-# ==============================================================================
-
 idx_dose1   <- which(age >= 1.5 / 12 & age <= 3.0 / 12)
 idx_dose2   <- which(age >= 3.5 / 12 & age <= 5.0 / 12)
 idx_booster <- which(age >= 11.5 / 12 & age <= 15.0 / 12)
 
-coverage_trend <- pmin(0.50 + 0.40 * (time_vax / 3)^0.8, 0.90)
+#changing trend in vaccination coverage proportion: bounded non-linear growth trend starting at p=0.50 and scaling upward over time, flattening at maximum  of p=0.95
+coverage_trend <- pmin(0.50 + 0.40 * (time_vax / 2)^0.8, 0.90)
 
-v_rate_none_to_low_matrix <- matrix(0, nrow = n_age, ncol = n_time_steps)
+
+v_rate_none_to_low_matrix <- matrix(0, nrow = n_age, ncol =n_time_steps)
+
 v_rate_to_high_matrix      <- matrix(0, nrow = n_age, ncol = n_time_steps)
 
 for (k in seq_len(n_time_steps)) {
   cov_k <- coverage_trend[k]
   
   v_rate_none_to_low_matrix[idx_dose1, k] <- -log(1 - cov_k * 0.65) / (da)
+  
   v_rate_to_high_matrix[idx_dose2, k]     <- -log(1 - cov_k * 0.92) / (da)
+  
   v_rate_to_high_matrix[idx_booster, k]   <- -log(1 - cov_k * 0.95) / (da * 3)
 }
+
 ```
 
 # Initial Condition
-
 ```{r new-initial-condition}
 frac_maternal_high <- 0.79
 frac_maternal_low  <- 0.00
@@ -241,11 +243,8 @@ ggplot(initial_counts_df, aes(age, count, colour = compartment)) +
   )
 ```
 
-# Core Numerical Pieces
-
 ## Force of infection and birth influx
 The force of infection is now driven by **total carriers**, and the population total in the denominator now includes `C` and `D` as well as `S`.
-
 ```{r forcing-functions-and-reaction-step}
 force_of_infection <- function(S, C, D, beta_matrix, susceptibility, infectiousness, age_group_idx, da, lambda_ext = 0.0005) {
   total_S <- rowSums(S)
@@ -498,7 +497,7 @@ simulate_mcvf_sir_imex_dynamic <- function(
 # 1. BURN-IN TO ENDEMIC EQUILIBRIUM (NO VAX)
 # ==============================================================================
 message("Running 100-year burn-in to establish equilibrium initial conditions...")
-burnin_horizon <- 100
+burnin_horizon <- 20
 time_burnin    <- seq(0, burnin_horizon, by = dt)
 
 out_burnin <- simulate_mcvf_sir_imex_dynamic(
@@ -523,7 +522,7 @@ D0_eq <- out_burnin$final_state$D
 # ==============================================================================
 # 2. RUN COUNTERFACTUAL SCENARIO (30 YEARS, NO VAX, DYNAMIC DEMOGRAPHICS)
 # ==============================================================================
-message("Running 30-year counterfactual scenario (1990-2020)...")
+message("Running 30-year counterfactual scenario (1988-2018)...")
 out_counterfactual <- simulate_mcvf_sir_imex_dynamic(
   S0 = S0_eq, C0 = C0_eq, D0 = D0_eq, age = age, time = time_vax, da = da, dt = dt, grid = grid,
   beta_matrix = beta_matrix, age_group_idx = age_group_idx, sigma = sigma,
@@ -559,13 +558,11 @@ out_vax <- simulate_mcvf_sir_imex_dynamic(
   v_rate_none_to_low_matrix = v_rate_none_to_low_matrix,
   v_rate_to_high_matrix = v_rate_to_high_matrix
 )
+
 ```
 
-
+# DIFFERENCING ANALYSIS & METRICS COMPUTATION
 ```{r diff-analysis}
-# ==============================================================================
-# DIFFERENCING ANALYSIS & METRICS COMPUTATION (1990 - 2020)
-# ==============================================================================
 cfr_hib <- 0.05
 
 summary_counter <- out_counterfactual$summary %>% mutate(scenario = "Counterfactual (No Vax)")
@@ -625,7 +622,7 @@ cumulative_summary <- tibble(
   `Net Averted / Impact`    = c(round(tot_cases_averted), round(tot_deaths_averted), paste0(round(overall_pct_red, 1), "%"))
 )
 
-kable(cumulative_summary, caption = "30-Year Cumulative Impact Analysis (1990–2020)")
+kable(cumulative_summary, caption = "30-Year Cumulative Impact Analysis (1988–2018)")
 
 ```
 
@@ -638,7 +635,6 @@ ggplot() +
   scale_color_manual(values = c("Counterfactual (No Vax)" = "#D95F02", "Hib Vaccination Program" = "#1B9E77")) +
   labs(
     title = "Annual Severe Invasive Hib Cases (1990–2020)",
-    subtitle = "Navajo Nation 30-Year Simulation with Dynamic Demographics",
     x = "Calendar Year",
     y = "Annual Severe Disease Cases",
     color = "Scenario"
@@ -656,7 +652,7 @@ ggplot(plot_cum, aes(x = year, y = count, fill = metric)) +
   facet_wrap(~ metric, scales = "free_y", ncol = 1) +
   scale_fill_manual(values = c("Cumulative Severe Cases Averted" = "#2B8CBE", "Cumulative Deaths Averted" = "#E6550D")) +
   labs(
-    title = "Cumulative Public Health Impact of Hib Vaccination (1990–2020)",
+    title = "Cumulative Severe Cases and Deaths Averted due to Hib Vaccination (1990–2020)",
     x = "Calendar Year",
     y = "Cumulative Quantity Averted"
   ) +
