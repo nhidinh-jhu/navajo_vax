@@ -41,29 +41,34 @@ age <- grid$x.mid # Age values at bin centers
 time <- seq(0, time_max, by = dt)
 
 n_age <- length(age) # Number of age bins
-cfl <- dt / da 
+cfl <- dt / da  
 stopifnot(cfl <= 1) # Sanity check for CFL condition
 
 # Population scale
 N_target <- 200000 
 
-# Calculate the true stable survival curve directly from baseline mortality
+# DEFINE BASELINE DEMOGRAPHICS FIRST (so we can use them for initial conditions)
+fertility_raw_base <- exp(-0.5 * ((age - 22) / 6)^2)
+#mortality_base <- 0.008 + 0.06 / (1 + exp(-(age - 72) / 5))
+mortality_base <- 0.025 * exp(-age * 2.0) + 0.004 + 0.06 / (1 + exp(-(age - 70) / 5))
+#at age 0 risk of death is 2.5% per year, risk decays at rate 2% per year, baseline mortality of about 0.4% per year, rising at rate 0.06/(1+exp(-(age-70)/5))
+
+# NOW CALCULATE TRUE STABLE AGE DISTRIBUTION
 survival_stable <- exp(-cumsum(mortality_base) * da)
-survival_stable <- c(1, head(survival_stable, -1)) # Start at age 0 with survival = 1
-
-# Normalize to get the stable age shape
+survival_stable <- c(1, head(survival_stable, -1)) # start at age 0 with survival = 1
 N0_shape_stable <- survival_stable / sum(survival_stable * da)
-
-# Scale precisely to your N_target (200,000 persons)
 N0_density <- N0_shape_stable * N_target
 
-# Beta transmission parameter set to estimated values for Alaska Native populatio per Jackson et al.
+# Beta transmission parameter set to estimated values for Alaska Native population per Jackson et al.
 beta_matrix <- matrix(c(
     2.11, 0.15, 0.53, 0.03,  #[0,1]
     0.55, 0.40, 0.50, 0.12,  #[2,4]
     0.56, 3.68, 3.61, 0.13,  #[5,9]
     0.55, 0.55, 0.81, 1.43   #[>=10]
 ), nrow = 4, byrow = TRUE)
+
+# Scale down transmission matrix by ~10% to reduce baseline transmission to observed ~80 per 100k under 5 severe case incidence
+beta_matrix <- beta_matrix * 0.90
 
 age_group_idx <- dplyr::case_when(
   age < 2.0 ~ 1,
@@ -79,11 +84,9 @@ infectiousness <- rep(1, length(age))
 demo_time <- seq(0, 50, by = 1)
 n_demo_time <- length(demo_time)
 
-mortality_base <- 0.008 + 0.06 / (1 + exp(-(age - 72) / 5))
-fertility_raw_base <- exp(-0.5 * ((age - 22) / 6)^2)
-
 mortality_decline <- 0.99^(demo_time)
-fertility_drop <- seq(1, 0.95, length.out = n_demo_time)
+fertility_drop <- seq(1, 0.99, length.out = n_demo_time)
+#fertility_drop <- seq(1, 0.95, length.out = n_demo_time)
 
 mortality_mat <- matrix(NA, nrow = n_age, ncol = n_demo_time)
 fertility_mat <- matrix(NA, nrow = n_age, ncol = n_demo_time)
@@ -93,7 +96,7 @@ for (t in 1:n_demo_time) {
   mortality_mat[, t] <- mortality_base * mortality_decline[t]
   fertility_mat[, t] <- fertility_raw_base * fertility_drop[t]
   
-  scale_t <- sum(mortality_mat[, t] * N0_shape * da) / sum(fertility_mat[, t] * N0_shape * da)
+  scale_t <- sum(mortality_mat[, t] * N0_shape_stable * da) / sum(fertility_mat[, t] * N0_shape_stable * da)
   fertility_mat_scaled[, t] <- scale_t * fertility_mat[, t]
 }
 
@@ -119,12 +122,24 @@ sigma <- (sigma_base_annual + sigma_amp_annual * exp(-decay_rate_weekly * age_in
 immunity_classes <- c("none", "low", "high")
 n_immunity <- length(immunity_classes)
 
-s_immunity <- c(none = 1.0, low = 1.0, high = 0.04)
-alpha_L <- 1 - s_immunity["low"]
-alpha_H <- 1 - s_immunity["high"]
+# ==============================================================================
+# REFINED VACCINE PROTECTION PARAMETERS
+# ==============================================================================
 
-beta_L <- 0.90
-beta_H <- 0.98
+# 1. Protection against carriage acquisition (reduction in force of infection)
+alpha_L <- 0.40  # Dose 1: 40% reduction in getting colonized
+alpha_H <- 0.75  # Booster/High: 75% reduction in getting colonized
+
+# Corresponding susceptibility multipliers for the immunity classes
+s_immunity <- c(
+  none = 1.0,
+  low  = 1 - alpha_L,  # 0.60
+  high = 1 - alpha_H   # 0.25
+)
+
+# 2. Protection against invasive disease progression (reduction in sigma)
+beta_L  <- 0.85  # Dose 1: 85% protection against severe disease if colonized
+beta_H  <- 0.98  # Booster/High: 98% protection against severe disease if colonized
 
 wane_high_to_low <- dplyr::case_when(
   age < 1.0 ~ 4.9987,
@@ -142,9 +157,8 @@ vaccine_efficacy <- ifelse(age < 1.0, 0.99, 1.00)
 # Define vaccination timeline parameters
 time_vax <- seq(0, 30, by = dt)
 n_time_steps <- length(time_vax)
-```
 
-```{r ingredient-plots}
+#Ingredient plots
 ingredient_df <- tibble(
   age = age,
   mortality = mortality_mat[, 1],
@@ -161,33 +175,47 @@ ggplot(ingredient_df, aes(age, value)) +
     x = "Age (years)", y = "Value"
   )
 
-# REALISTIC HIB DOSE SCHEDULE & TIME-VARYING VACCINATION MATRIX
-idx_dose1   <- which(age >= 1.5 / 12 & age <= 3.0 / 12)
-idx_dose2   <- which(age >= 3.5 / 12 & age <= 5.0 / 12)
-idx_booster <- which(age >= 11.5 / 12 & age <= 15.0 / 12)
+```
 
-#changing trend in vaccination coverage proportion: bounded non-linear growth trend starting at p=0.50 and scaling upward over time, flattening at maximum  of p=0.95
-coverage_trend <- pmin(0.50 + 0.40 * (time_vax / 2)^0.8, 0.90)
+```{r vaccination-parameters}
 
+#  HIB VACCINATION SCHEDULE & IHS ROLLOUT (1990-1993 RAPID SCALE-UP)
 
-v_rate_none_to_low_matrix <- matrix(0, nrow = n_age, ncol =n_time_steps)
+# Map precise age bin indices for da = 0.25 (3-month bins)
+# Bin 1 (center 0.125 yrs / ~1.5 mos) -> Primary Dose 1
+# Bin 2 (center 0.375 yrs / ~4.5 mos) -> Primary Dose 2 
+# Bin 5 (center 1.125 yrs / ~13.5 mos) -> Toddler Booster
+idx_dose1   <- which(age >= 0.0 & age < 0.25)  
+idx_dose2   <- which(age >= 0.25 & age < 0.50) 
+idx_booster <- which(age >= 1.00 & age < 1.50) 
 
-v_rate_to_high_matrix      <- matrix(0, nrow = n_age, ncol = n_time_steps)
+# Logistic scale-up: 
+# - time_vax = 0 corresponds to 1988 (~8% coverage from early clinical trials)
+# - time_vax = 2 corresponds to 1990 (~48-50% coverage at licensure)
+# - Saturates around 95% by the mid-1990s
+coverage_trend <- 0.95 / (1 + exp(-1.2 * (time_vax - 2.0)))
+
+# Initialize vaccination rate matrices
+v_rate_none_to_low_matrix <- matrix(0, nrow = n_age, ncol = n_time_steps)
+v_rate_to_high_matrix     <- matrix(0, nrow = n_age, ncol = n_time_steps)
 
 for (k in seq_len(n_time_steps)) {
   cov_k <- coverage_trend[k]
   
-  v_rate_none_to_low_matrix[idx_dose1, k] <- -log(1 - cov_k * 0.65) / (da)
+  # Dose 1: Moves infants from 'none' to 'low' immunity 
+  # (Assumes ~65% effective partial protection from 1st dose of PRP-OMP)
+  v_rate_none_to_low_matrix[idx_dose1, k] <- -log(1 - cov_k * 0.65) / da
   
-  v_rate_to_high_matrix[idx_dose2, k]     <- -log(1 - cov_k * 0.92) / (da)
+  # Dose 2: Moves infants to 'high' immunity 
+  # (Completes primary series, achieving >90% efficacy)
+  v_rate_to_high_matrix[idx_dose2, k]      <- -log(1 - cov_k * 0.92) / da
   
-  v_rate_to_high_matrix[idx_booster, k]   <- -log(1 - cov_k * 0.95) / (da * 3)
+  # Booster: Secures long-term 'high' immunity robustness in second year of life
+  v_rate_to_high_matrix[idx_booster, k]   <- -log(1 - cov_k * 0.95) / (da * 2)
 }
-
 ```
 
-# Initial Condition
-```{r new-initial-condition}
+```{r initial-conditions}
 frac_maternal_high <- 0.79
 frac_maternal_low  <- 0.00
 frac_maternal_none <- 1 - frac_maternal_high - frac_maternal_low
@@ -243,9 +271,9 @@ ggplot(initial_counts_df, aes(age, count, colour = compartment)) +
   )
 ```
 
-## Force of infection and birth influx
-The force of infection is now driven by **total carriers**, and the population total in the denominator now includes `C` and `D` as well as `S`.
 ```{r forcing-functions-and-reaction-step}
+#The force of infection is now driven by total carriers, and the population total in the denominator now includes `C` and `D` as well as `S`.
+
 force_of_infection <- function(S, C, D, beta_matrix, susceptibility, infectiousness, age_group_idx, da, lambda_ext = 0.0005) {
   total_S <- rowSums(S)
   total_C <- rowSums(C)
@@ -400,7 +428,6 @@ simulate_mcvf_sir_imex_dynamic <- function(
     mortality_now <- if (is.matrix(mortality_matrix)) mortality_matrix[, year_idx] else mortality_matrix
     fertility_now <- if (is.matrix(fertility_matrix)) fertility_matrix[, year_idx] else fertility_matrix
     
-    # Corrected indexing by simulation step n
     v_none_to_low_now <- if (!is.null(v_rate_none_to_low_matrix)) v_rate_none_to_low_matrix[, n] else NULL
     v_to_high_now     <- if (!is.null(v_rate_to_high_matrix)) v_rate_to_high_matrix[, n] else NULL
 
@@ -414,6 +441,7 @@ simulate_mcvf_sir_imex_dynamic <- function(
       lambda_ext = lambda_ext
     )
     
+#Set births equal to deaths to keep stable population size 
     total_deaths_now <- sum(mortality_now * (rowSums(S) + rowSums(C) + D) * da)
     births_now <- total_deaths_now
 
@@ -431,7 +459,7 @@ simulate_mcvf_sir_imex_dynamic <- function(
 
     summary_store[[n]] <- tibble(
       time = t_now, 
-      year = 1990 + t_now,
+      year = 1988 + t_now,
       S = total_S,
       S_none = total_S_by_class["none"], S_low = total_S_by_class["low"], S_high = total_S_by_class["high"],
       C = total_C,
@@ -490,13 +518,9 @@ simulate_mcvf_sir_imex_dynamic <- function(
 }
 ```
 
-# Run the Simulation
-
 ```{r run-simulation}
-# ==============================================================================
 # 1. BURN-IN TO ENDEMIC EQUILIBRIUM (NO VAX)
-# ==============================================================================
-message("Running 100-year burn-in to establish equilibrium initial conditions...")
+message("Running 20-year burn-in to establish equilibrium initial conditions...")
 burnin_horizon <- 20
 time_burnin    <- seq(0, burnin_horizon, by = dt)
 
@@ -512,16 +536,14 @@ out_burnin <- simulate_mcvf_sir_imex_dynamic(
   rho_C = rho_C, rho_I = rho_I,
   frac_maternal_none = frac_maternal_none, frac_maternal_low = frac_maternal_low,
   frac_maternal_high = frac_maternal_high, 
-  snapshot_times = c(0, 50, 100)
+  snapshot_times = c(0, 10, 20)
 )
 
 S0_eq <- out_burnin$final_state$S
 C0_eq <- out_burnin$final_state$C
 D0_eq <- out_burnin$final_state$D
 
-# ==============================================================================
 # 2. RUN COUNTERFACTUAL SCENARIO (30 YEARS, NO VAX, DYNAMIC DEMOGRAPHICS)
-# ==============================================================================
 message("Running 30-year counterfactual scenario (1988-2018)...")
 out_counterfactual <- simulate_mcvf_sir_imex_dynamic(
   S0 = S0_eq, C0 = C0_eq, D0 = D0_eq, age = age, time = time_vax, da = da, dt = dt, grid = grid,
@@ -539,9 +561,7 @@ out_counterfactual <- simulate_mcvf_sir_imex_dynamic(
   v_rate_to_high_matrix = NULL
 )
 
-# ==============================================================================
 # 3. RUN VACCINATION SCENARIO (30 YEARS, REALISTIC HIB VAX, DYNAMIC DEMOGRAPHICS)
-# ==============================================================================
 message("Running 30-year Hib vaccination scenario (1990-2020)...")
 out_vax <- simulate_mcvf_sir_imex_dynamic(
   S0 = S0_eq, C0 = C0_eq, D0 = D0_eq, age = age, time = time_vax, da = da, dt = dt, grid = grid,
@@ -561,8 +581,8 @@ out_vax <- simulate_mcvf_sir_imex_dynamic(
 
 ```
 
-# DIFFERENCING ANALYSIS & METRICS COMPUTATION
 ```{r diff-analysis}
+# DIFFERENCING ANALYSIS & METRICS COMPUTATION
 cfr_hib <- 0.05
 
 summary_counter <- out_counterfactual$summary %>% mutate(scenario = "Counterfactual (No Vax)")
@@ -626,7 +646,6 @@ kable(cumulative_summary, caption = "30-Year Cumulative Impact Analysis (1988–
 
 ```
 
-
 ```{r counterfactual-vs-vaccination-trajectories}
 # Plot 1: Annual Severe Disease Cases Trajectory
 ggplot() +
@@ -634,7 +653,7 @@ ggplot() +
   geom_line(data = comp_df, aes(x = year, y = disease_incidence_vax, color = "Hib Vaccination Program"), linewidth = 1.2) +
   scale_color_manual(values = c("Counterfactual (No Vax)" = "#D95F02", "Hib Vaccination Program" = "#1B9E77")) +
   labs(
-    title = "Annual Severe Invasive Hib Cases (1990–2020)",
+    title = "Annual Severe Invasive Hib Cases (1988–2018)",
     x = "Calendar Year",
     y = "Annual Severe Disease Cases",
     color = "Scenario"
@@ -652,7 +671,7 @@ ggplot(plot_cum, aes(x = year, y = count, fill = metric)) +
   facet_wrap(~ metric, scales = "free_y", ncol = 1) +
   scale_fill_manual(values = c("Cumulative Severe Cases Averted" = "#2B8CBE", "Cumulative Deaths Averted" = "#E6550D")) +
   labs(
-    title = "Cumulative Severe Cases and Deaths Averted due to Hib Vaccination (1990–2020)",
+    title = "Cumulative Severe Cases and Deaths Averted due to Hib Vaccination (1988–2018)",
     x = "Calendar Year",
     y = "Cumulative Quantity Averted"
   ) +
@@ -660,13 +679,8 @@ ggplot(plot_cum, aes(x = year, y = count, fill = metric)) +
   theme(legend.position = "none", plot.title = element_text(face = "bold"))
 ```
 
-
-
-
 ```{r postvax-plots-one}
-# ==============================================================================
-# 4. PLOT INCIDENCE IMPACT POST-VACCINATION
-# ==============================================================================
+# PLOT INCIDENCE IMPACT POST-VACCINATION
 summary_vax_df <- out_vax$summary %>%
   mutate(
     total_pop = S_none + S_low + S_high + C_none + C_low + C_high + D,
@@ -984,7 +998,7 @@ check_incidence_scaling <- function(sim_obj, cases_col = "new_cases") {
 # 1. Run burn-in check using out_burnin directly
 check_burnin_convergence(out_burnin, state_cols = c("S", "I", "R"))
 
-# 2. Run main simulation proportion check (pass your 1990-2020 object name here)
+# 2. Run main simulation proportion check (pass 1990-2020 object name here)
 sim_props <- check_proportions(out_vax)
 
 # 3. Run incidence scaling check (update 'new_cases' if your column is named differently)
